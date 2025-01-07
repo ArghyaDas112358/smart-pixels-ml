@@ -34,8 +34,12 @@ pip install -r requirements.txt
 ```
 Testing successful installation by running 
 ```bash
-python test_run.py
+python test_run.py`
 ```
+The test run should perform a basic smoke test to check if the installation is successful and basic things that we need are working fine. The output should look like this:
+
+![test_run](Images/test_run.gif)
+
 ### Usage
 
 For the usage guide refer to [Usage Guide](usage.md)
