@@ -36,7 +36,8 @@ Testing successful installation by running
 ```bash
 python test_run.py`
 ```
-The test run should perform a basic smoke test to check if the installation is successful and basic things that we need are working fine. The output should look like this:
+The test run should perform a basic smoke test to check if the installation is successful and basic things that we need are working fine. Details can be found in [Testing](testing.md)
+ > The output should look like this:
 
 ![test_run](Images/test_run.gif)
 
