@@ -4,11 +4,12 @@ import tensorflow_probability as tfp
 tfd = tfp.distributions
 pi = 3.14159265359
 
-def build_scale_tril(p_base, minval=1e-9):
+def build_scale_tril(p_base, minval=1e-6):
     mu = p_base[:, 0:8:2]
     Mdia = minval + tf.math.maximum(p_base[:, 1:8:2], 0.0)
-    Mcov = p_base[:, 8:]
-
+    Mcov = p_base[:,8:]
+    
+    
     zeros = tf.zeros_like(Mdia[:, 0])
 
     row1 = tf.stack([Mdia[:, 0], zeros, zeros, zeros], axis=-1)
@@ -16,8 +17,10 @@ def build_scale_tril(p_base, minval=1e-9):
     row3 = tf.stack([Mcov[:, 1], Mcov[:, 2], Mdia[:, 2], zeros], axis=-1)
     row4 = tf.stack([Mcov[:, 3], Mcov[:, 4], Mcov[:, 5], Mdia[:, 3]], axis=-1)
 
-    scale_tril = tf.stack([row1, row2, row3, row4], axis=1)  # shape: [batch, 4, 4]
+    scale_tril = tf.stack([row1, row2, row3, row4], axis=1)
+
     return mu, scale_tril
+
 
 def loss_nll(y, p_base, minval=1e-9, maxval=1e9):
     mu, scale_tril = build_scale_tril(p_base, minval)
@@ -53,13 +56,76 @@ def multivariate_crps_mc(y, dist, n_samples):
     pairwise = tf.norm(s1 - s2, axis=-1)  # [n_samples, n_samples, batch]
     E2 = 0.5 * tf.reduce_mean(pairwise, axis=[0, 1])  # [batch]
 
-    tf.debugging.assert_all_finite(L, "NaNs/Infs in Cholesky factor L")
-    tf.debugging.assert_all_finite(samples, "NaNs/Infs in sampled values")
-    tf.debugging.assert_all_finite(diff, "NaNs/Infs in E1 distance calculation")
-    tf.debugging.assert_all_finite(pairwise, "NaNs/Infs in E2 pairwise distances")
+    return tf.reduce_sum(E1 - E2)
 
-    return tf.reduce_mean(E1 - E2)
 
+def multivariate_crps(y_true, mu, scale_tril, epsilon=1e-7):
+    # Paper: https://arxiv.org/pdf/2410.09133
+
+    batch_size = tf.shape(y_true)[0]
+    d = tf.shape(y_true)[1]
+
+    diag_jitter = tf.eye(d, batch_shape=[batch_size], dtype=scale_tril.dtype) * epsilon
+    Sigma = tf.matmul(scale_tril, scale_tril, transpose_b=True) + diag_jitter
+
+    # Use only u (U), not v
+    s, u, _ = tf.linalg.svd(Sigma)
+    s_safe = s + epsilon  # safer than maximum
+
+    s_inv_sqrt = tf.pow(s_safe, -0.5)
+    s_inv_sqrt_diag = tf.linalg.diag(s_inv_sqrt)
+
+    diff = y_true - mu
+    diff_expanded = tf.expand_dims(diff, axis=-1)
+
+    U_T = tf.linalg.matrix_transpose(u)
+    w_temp = tf.matmul(U_T, diff_expanded)
+    w = tf.matmul(s_inv_sqrt_diag, w_temp)
+    w = tf.squeeze(w, axis=-1)
+
+    std_norm = tfd.Normal(loc=tf.zeros_like(w), scale=tf.ones_like(w))
+    cdf_w = std_norm.cdf(w)
+    pdf_w = std_norm.prob(w)
+
+    crps_term = w * (2.0 * cdf_w - 1.0) + 2.0 * pdf_w - (1.0 / tf.sqrt(pi))
+
+    lambda_sqrt = tf.sqrt(s_safe)
+    mvg_crps_elements = lambda_sqrt * crps_term
+    mvg_crps_per_batch_item = tf.reduce_sum(mvg_crps_elements, axis=-1)
+
+    return tf.reduce_sum(mvg_crps_per_batch_item)
+
+
+def custom_loss(loss_type='nll', minval=1e-9, maxval=1e9,
+                n_samples=300):
+    def loss_fn(y_true, y_pred):
+
+        mu, scale_tril = build_scale_tril(y_pred, minval)
+
+        dist = tfp.distributions.MultivariateNormalTriL(
+            loc=mu, scale_tril=scale_tril)
+
+        if loss_type.lower() == 'nll':
+            likelihood = dist.prob(y_true)
+            likelihood = tf.clip_by_value(
+                likelihood, minval, maxval)
+
+            NLL = -1.0 * tf.math.log(likelihood)
+            return tf.reduce_sum(NLL)
+
+        elif loss_type.lower() == 'crps_mc': # Realistic but unstable
+            return multivariate_crps_mc(y_true, dist, n_samples)
+
+        elif loss_type.lower() == 'crps': # Stable approximation
+            return multivariate_crps(y_true, mu, scale_tril)
+
+        elif loss_type.lower() == 'kl_div':
+            return kl_div_term(y_true, y_pred)
+
+        else:
+            raise ValueError(f"Invalid loss_type "
+                             f"'{loss_type}'")
+    return loss_fn
 
 @tf.function
 def empirical_kl(p_vals, q_vals, epsilon=1e-10):
