@@ -1,3 +1,4 @@
+# OptimizedDataGeneratorNew.py
 import os
 import gc
 import math
@@ -35,26 +36,12 @@ def QKeras_data_prep_quantizer(data, bits=4, int_bits=0, alpha=1):
     quantizer = quantized_bits(bits, int_bits, alpha=alpha)
     return quantizer(data)
 
-
-def split_df_to_X_y_df(df: pd.DataFrame,
-                       input_shape: Tuple[int, int, int],
-                       labels_list: List[str],
-                       recon_cols: List[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-
-    X_df = df[recon_cols].copy()
-    y_df = df[labels_list].copy()
-
-    return X_df, y_df
-
-
-
 class OptimizedDataGenerator(tf.keras.utils.Sequence):
     def __init__(self, 
             dataset_base_dir: str = "./",
-            is_directory_recursive: bool = False,
             batch_size: int = 32,
             file_count = None,
-            labels_list: Union[List,str] = "cotAlpha",
+            labels_list: Union[List,str] = ['x-midplane','y-midplane','cotAlpha','cotBeta'],
             to_standardize: bool = False,
             input_shape: Tuple = (13,21),
             transpose = None,
@@ -69,6 +56,7 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
             seed: int = None,
             quantize: bool = False,
             max_workers: int = 1,
+            keep_dask_indx = True, # Make this False 
                  
             **kwargs,
             ):
@@ -79,7 +67,7 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
             self.seed = seed if seed is not None else 13
             self.rng = np.random.default_rng(seed = self.seed)
         
-        # If data is already prepared load anduse that data
+        # If data is already prepared load -> load that data and use
         if load_from_tfrecords_dir is not None:
             self.file_offsets = [None]
             if not os.path.isdir(load_from_tfrecords_dir):
@@ -98,13 +86,9 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
                 np.arange(t * len_xy, (t + 1) * len_xy).astype(str)
                 for t in use_time_stamps
             ]
-            self.use_time_stamps = list(np.arange(0,20)) if use_time_stamps == -1 else use_time_stamps
             self.recon_cols = np.concatenate(col_indices).tolist()
     
-    
-    
             self.max_workers = max_workers
-            self.shuffle = shuffle
 
             
             self.files = sorted(glob.glob(os.path.join(dataset_base_dir, "part.*.parquet"), recursive=False))
@@ -115,13 +99,10 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
                 else:
                     self.files = self.files[-file_count:]
     
-    
             self.file_offsets = [0]
             self.dataset_mean = None
             self.dataset_std = None
 
-            # safe_remove_directory(tfrecords_dir)
-            utils.safe_remove_directory(tfrecords_dir)
             self.batch_size = batch_size
             self.labels_list = labels_list
             self.input_shape = input_shape
@@ -136,6 +117,7 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
     
             if tfrecords_dir is None:
                 raise ValueError(f"tfrecords_dir is None")
+            utils.safe_remove_directory(tfrecords_dir)
                 
             self.tfrecords_dir = tfrecords_dir    
             os.makedirs(self.tfrecords_dir, exist_ok=True)
@@ -149,7 +131,7 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
 
 
     def process_file_parallel(self):
-        file_infos = [(afile, self.recon_cols, self.input_shape, self.transpose, self.labels_list) for afile in self.files]
+        file_infos = [(afile, self.recon_cols, self.input_shape, self.transpose) for afile in self.files]
         results = []
         with ProcessPoolExecutor(self.max_workers) as executor:
             futures = [executor.submit(self._process_file_single, file_info) for file_info in file_infos]
@@ -177,9 +159,9 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
 
     @staticmethod
     def _process_file_single(file_info):
-        afile, recon_cols, input_shape, transpose, labels_list = file_info
-        df = pd.read_parquet(afile, columns=recon_cols + labels_list)
-        adf, _ = split_df_to_X_y_df(df, input_shape, labels_list, recon_cols)
+        afile, recon_cols, input_shape, transpose = file_info
+
+        adf = pd.read_parquet(afile, columns=recon_cols)
 
         x = adf.values
         nonzeros = abs(x) > 0
@@ -192,6 +174,7 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
             x = x.transpose(transpose)
         amin, amax = np.min(centered), np.max(centered)
         len_adf = len(adf)
+
         del adf
         gc.collect()
         
@@ -253,12 +236,13 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
         except Exception as e:
             return f"Error saving batch {batch_index}: {e}" 
         
-    def prepare_batch_data(self, batch_index):
+    def prepare_batch_data(self, batch_index, debug=False):
         """
         Fetch and prepare one batch (X, y).
         """
-        abs_idx = batch_index * self.batch_size
-        file_idx = (np.arange(self.file_offsets.size)[abs_idx < self.file_offsets][0] - 1)
+        abs_idx = batch_index * self.batch_size # absolute *event* index
+        file_idx = np.searchsorted(self.file_offsets, abs_idx, side="right") - 1
+
         rel_idx = abs_idx - self.file_offsets[file_idx]
         stop_idx = min(rel_idx + self.batch_size, self.file_offsets[file_idx + 1] - self.file_offsets[file_idx])
 
@@ -266,27 +250,23 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
             self.current_file_index = file_idx
             parquet_file = self.files[file_idx]
 
-            all_columns_to_read = self.recon_cols + self.labels_list
-            df = pd.read_parquet(parquet_file, columns=all_columns_to_read)
+            df = (pd.read_parquet(parquet_file,
+                                columns=self.recon_cols + self.labels_list)
+                    .dropna(subset=self.recon_cols)
+                    .reset_index(drop=True))
+            
+            if self.shuffle:
+                df = df.sample(frac=1, random_state=self.seed).reset_index(drop=True)
+            
 
-            # df = pd.read_parquet(parquet_file, columns=self.use_time_stamps)
-            recon_df, labels_df = split_df_to_X_y_df(df, self.input_shape, self.labels_list, self.recon_cols)
+            recon_df  = df[self.recon_cols]
+            labels_df = df[self.labels_list]
 
-            has_nans = np.any(np.isnan(recon_df.values), axis=1)
-            has_nans = np.arange(recon_df.shape[0])[has_nans]
-            recon_df_raw = recon_df.drop(has_nans)
-            labels_df_raw = labels_df.drop(has_nans)
 
-            joined_df = recon_df_raw.join(labels_df_raw)
-
-            if self.shuffle: # Changed
-                joined_df = joined_df.sample(frac=1, random_state=self.seed).reset_index(drop=True)  
-
-            recon_values = joined_df[recon_df_raw.columns].values            
-
+            recon_values = recon_df.values            
             nonzeros = abs(recon_values) > 0
             
-            recon_values[nonzeros] = np.sign(recon_values[nonzeros])*np.log1p(abs(recon_values[nonzeros]))/math.log(2)
+            recon_values[nonzeros] = np.sign(recon_values[nonzeros])*np.log1p(abs(recon_values[nonzeros]))/np.log(2)
             
             if self.to_standardize:
                 recon_values[nonzeros] = self.standardize(recon_values[nonzeros])
@@ -298,16 +278,25 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
             
             self.current_dataframes = (
                 recon_values, 
-                joined_df[labels_df_raw.columns].values,
+                labels_df.values,
             )        
         
         recon_df, labels_df = self.current_dataframes
 
         X = recon_df[rel_idx:stop_idx]
         y = labels_df[rel_idx:stop_idx] / np.array([75., 18.75, 8.0, 0.5])
-    
+
+        if debug:
+            # print all the variables
+            print("abs_idx:", abs_idx)
+            print("file_idx:", file_idx)
+            print("self.file_offsets[file_idx]:", self.file_offsets[file_idx])
+            print("rel_idx:", rel_idx, "stop_idx:", stop_idx)
+            print("X.shape:", X.shape)
+            print("y.shape:", y.shape)
+
         if self.include_y_local:
-            y_local = labels_df.iloc[chosen_idxs]["y-local"].values
+            y_local = labels_df.iloc[rel_idx:stop_idx]["y-local"].values
             return [X, y_local], y
         else:
             return X, y
