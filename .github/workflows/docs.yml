@@ -1,0 +1,33 @@
+name: Deploy Documentation
+
+on:
+  push:
+    branches:
+      - CleanMain  
+
+# Allow the action to write to your 'gh-pages' branch
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.10
+
+      - name: Install documentation dependencies
+        run: |
+          pip install mkdocs
+          # Add any other mkdocs plugins you use here
+          # pip install mkdocs-material
+
+      - name: Deploy to GitHub Pages
+        run: |
+          # This one command builds the site AND pushes it to the 'gh-pages' branch
+          mkdocs gh-deploy --force
