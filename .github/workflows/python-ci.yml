@@ -36,4 +36,4 @@ jobs:
           extra_args: --all-files
 
       - name: Run unit tests
-        run: pytest -q
+        run: pytest -q --maxfail=1 -ra

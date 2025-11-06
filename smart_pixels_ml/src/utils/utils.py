@@ -5,7 +5,6 @@ import keras
 import numpy as np
 import tensorflow as tf
 
-
 def safe_remove_directory(directory_path):
     if Path(directory_path).exists():
         print(f"Directory {directory_path} is removed...")
