@@ -1,11 +1,7 @@
-import keras
-from keras.layers import *
-from keras.models import Sequential, Model
-from keras.utils import Sequence
-from qkeras import *
-
 import tensorflow as tf
-from tensorflow.keras import datasets, layers, models
+from keras.layers import *
+from keras.models import Model
+from qkeras import *
 
 
 def var_network(var, hidden=10, output=2):

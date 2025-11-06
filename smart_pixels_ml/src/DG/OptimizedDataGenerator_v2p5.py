@@ -1,23 +1,19 @@
 # OptimizedDataGenerator_v2.py
-import os
 import gc
-import math
 import glob
-import random
+import json
 import logging
-import datetime
+import math
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Dict, List, Tuple, Union
+
 import numpy as np
 import pandas as pd
-import json
-
-from typing import Union, List, Tuple, Dict, Any
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-
-from tqdm import tqdm
 import tensorflow as tf
-from qkeras import quantized_bits
-
 import utils
+from qkeras import quantized_bits
+from tqdm import tqdm
 
 # custom quantizer
 

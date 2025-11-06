@@ -3,17 +3,17 @@ import os
 
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
+import argparse
+import json
+import random
+import shutil
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import submitit
 # python based
 import tensorflow as tf
-import random
-from pathlib import Path
-import pandas as pd
-import argparse
-import submitit
-import json
-import numpy as np
-import shutil
-
 # custom code
 from dataloaders.OptimizedDataGenerator import OptimizedDataGenerator
 from models import CreateModel
@@ -106,10 +106,10 @@ def evaluate(config):
     df["M44"] = minval + tf.math.maximum(df["M44"], 0)
 
     # calculates residuals for x, y, cotA, cotB
-    residuals = df["xtrue"] - df["x"]
-    residualsy = df["ytrue"] - df["y"]
-    residualsA = df["cotAtrue"] - df["cotA"]
-    residualsB = df["cotBtrue"] - df["cotB"]
+    df["xtrue"] - df["x"]
+    df["ytrue"] - df["y"]
+    df["cotAtrue"] - df["cotA"]
+    df["cotBtrue"] - df["cotB"]
 
     # stores results as csv
     df.to_csv(config["outFileName"], header=True, index=False)

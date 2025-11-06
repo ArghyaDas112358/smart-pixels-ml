@@ -1,35 +1,39 @@
+# .github/workflows/python-ci.yml
 name: Python CI
-
 on:
   push:
-    branches: [ CleanBranch ]
+    branches: [ CleanBranch, CleanMain ]
   pull_request:
-    branches: [ CleanBranch ]
+    branches: [ CleanBranch, CleanMain ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - name: Check out repository
-      uses: actions/checkout@v4
-      with:
-        lfs: true
+      - uses: actions/checkout@v4
 
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
-        pip install pytest flake8 black
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-    - name: Check formatting with Black
-      run: black --check .
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pre-commit pytest
 
-    - name: Check for style errors with Flake8
-      run: flake8 . --count --show-source --statistics
+      - name: Run pre-commit (format/lint)
+        uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --all-files
 
-    - name: Run tests with Pytest
-      run: pytest
+      - name: Run unit tests
+        run: pytest -q

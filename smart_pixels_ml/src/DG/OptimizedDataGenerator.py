@@ -1,21 +1,19 @@
 # python imports
-import tensorflow as tf
-from qkeras import quantized_bits
-from typing import Union, List, Tuple
+import gc
 import glob
+import logging
+import math
+import os
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                as_completed)
+from typing import List, Tuple, Union
+
 import numpy as np
 import pandas as pd
-import math
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-import os
-import datetime
-import random
-import logging
-import gc
-
+import tensorflow as tf
 import utils
-
+from qkeras import quantized_bits
+from tqdm import tqdm
 
 # custom quantizer
 

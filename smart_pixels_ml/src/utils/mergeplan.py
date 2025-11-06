@@ -1,9 +1,9 @@
 # mergeplan.py
 
 
-import numpy as np
 import math
 
+import numpy as np
 
 file_offsets = [
     0,

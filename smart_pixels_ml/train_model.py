@@ -3,24 +3,23 @@ import os
 
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
-# tensorflow
-import tensorflow as tf
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
-
-# python based
-import random
-from pathlib import Path
-import time
 import argparse
 import json
-import submitit
+# python based
+import random
 import shutil
+import time
+from pathlib import Path
 
+import submitit
+# tensorflow
+import tensorflow as tf
 # custom code
 from dataloaders.OptimizedDataGenerator import OptimizedDataGenerator
 from loss import *
 from models import *
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
 
 # set gpu growth
 gpus = tf.config.list_physical_devices("GPU")

@@ -9,10 +9,11 @@
 #  5. Builds and trains a small model to ensure everything runs.
 #################################################################
 
-import sys
+import glob
 import os
 import shutil
-import glob
+import sys
+
 from colorama import Fore, Style
 
 
@@ -56,14 +57,11 @@ try:
     import numpy as np
     import pandas as pd
     import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras.optimizers import Adam
-    import qkeras
-
-    # custom modules
-    from OptimizedDataGenerator import OptimizedDataGenerator
     from loss import custom_loss
     from models import CreateModel
+    # custom modules
+    from OptimizedDataGenerator import OptimizedDataGenerator
+    from tensorflow.keras.optimizers import Adam
 
 except ImportError as exc:
     log_error(f"Missing dependency: {exc}")

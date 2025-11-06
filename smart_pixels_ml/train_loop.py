@@ -1,19 +1,15 @@
 # %%
-import tensorflow as tf
-from tensorflow.keras import layers
-import keras
-from keras.layers import *
-from qkeras import *
-
-from keras.callbacks import CSVLogger
-
+import csv
+import logging
 import os
 import random
-from datetime import datetime
-import logging
-import csv
 import time
+from datetime import datetime
+
+import keras
 import numpy as np  # Added for seeding
+import tensorflow as tf
+from tensorflow.keras import layers
 
 # --- LOGGING CONFIGURATION ---
 logging.basicConfig(
@@ -31,8 +27,8 @@ minval = 1e-9
 # %%
 from DG.OptimizedDataGenerator_v2p5 import OptimizedDataGenerator
 from losses.loss import custom_loss
-from models.SoftQuantizeLayer import SoftQuantizeLayer
 from models.AnnealingScheduler import AnnealingScheduler
+from models.SoftQuantizeLayer import SoftQuantizeLayer
 
 
 # %%

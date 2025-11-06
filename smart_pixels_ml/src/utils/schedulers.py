@@ -1,6 +1,6 @@
+import numpy as np
 import tensorflow as tf
 from keras.callbacks import Callback
-import numpy as np
 
 
 # Linear scheduler

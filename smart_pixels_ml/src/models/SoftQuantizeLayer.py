@@ -2,10 +2,11 @@
 # SoftQuantizeLayer.py
 # @Author: Arghya Ranjan Das
 
-import tensorflow as tf
-import numpy as np
 import math
-from typing import Optional, List
+from typing import List, Optional
+
+import numpy as np
+import tensorflow as tf
 
 # L_i = L0 + sum over j of softplus(Delta_L_raw[j])
 # T_0 = T_off + softplus(Delta_T_raw[0])
@@ -236,7 +237,6 @@ class SoftQuantizeLayer(tf.keras.layers.Layer):
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import Slider
 
     n_bits = 2
     num_levels = 2**n_bits

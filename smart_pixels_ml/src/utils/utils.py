@@ -1,8 +1,9 @@
 import shutil
 from pathlib import Path
-import tensorflow as tf
+
 import keras
 import numpy as np
+import tensorflow as tf
 
 
 def safe_remove_directory(directory_path):
