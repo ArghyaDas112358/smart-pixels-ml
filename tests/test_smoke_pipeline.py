@@ -1,32 +1,14 @@
-# tests/test_smoke_pipeline.py
 """
 Smoke test for the SmartPixels ML pipeline.
-
-# CHANGE: Converted the original interactive script into a pytest test using tmp_path.
-# REASON: CI-friendly, non-interactive, auto-cleaned temporary workspace.
-
-# CHANGE: Removed colorized logging and input(), replaced with plain prints and assertions.
-# REASON: Deterministic output in CI; no interactive prompts.
-
-# CHANGE: Switched to package-safe imports by augmenting sys.path for 'smart_pixels_ml/src'.
-# REASON: Ensure imports work without installing the package. Keeps repo structure intact.
-
-# CHANGE: Minimized dataset size and epochs.
-# REASON: Keep test fast and reliable under CI time limits.
-
-# CHANGE: Separated TFRecord generation and loading phases with the same parameters used in codebase.
-# REASON: Validate both code paths without heavy runtime.
-
-# CHANGE: Skips the test gracefully if required heavy deps are missing (tensorflow/pyarrow).
-# REASON: Clear failure mode; prevents cryptic ImportErrors in CI if requirements are incomplete.
+(Refactored with pytest fixtures for clarity and modularity)
 """
-
 from __future__ import annotations
 import os
 import sys
 import glob
 import math
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -58,116 +40,105 @@ from models.models import CreateModel  # type: ignore
 # ----------------------------
 # Small, fast test parameters
 # ----------------------------
-DATA_SET_SIZE = 24   # keep > BATCH_SIZE to exercise batching
+DATA_SET_SIZE = 24  # keep > BATCH_SIZE to exercise batching
 BATCH_SIZE = 4
 TRAIN_FILE_COUNT = 2
 VAL_FILE_COUNT = 2
 NUM_EPOCHS = 1
 
-INPUT_SHAPE_HW_C = (13, 21, 2)   # Model expects (H,W,C) = (13,21,2)
-TIME_STAMPS = [0, 19]            # Two timestamps -> 2 channels
-TIME_LEN = 20                    # Matches stamps above
+INPUT_SHAPE_HW_C = (13, 21, 2)  # Model expects (H,W,C) = (13,21,2)
+TIME_STAMPS = [0, 19]  # Two timestamps -> 2 channels
+TIME_LEN = 20  # Matches stamps above
 SCALINGS = [75.0, 18.75, 10.0, 1.22]
 LABELS = ["x-midplane", "y-midplane", "cotAlpha", "cotBeta"]
 
 
-def _generate_dummy_parquet(data_dir: Path, labels_dir: Path, n_files: int) -> None:
+# --- Helper Classes for Fixture Payloads ---
+class PipelinePaths(NamedTuple):
+    """A simple struct to hold all temporary paths for the test."""
+    data_dir: Path
+    labels_dir: Path
+    tfrecords_train: Path
+    tfrecords_val: Path
+    base_model_dir: Path
+
+class TFRecordPaths(NamedTuple):
+    """A simple struct to hold the output of the TFRecord writing step."""
+    train_dir: Path
+    val_dir: Path
+
+
+# --- Fixture Definitions ---
+
+@pytest.fixture(scope="module")
+def pipeline_paths(tmp_path_factory: pytest.TempPathFactory) -> PipelinePaths:
     """
-    Generate tiny dummy data/label parquet files to feed DG.
-    Data shape matches the code's expectations: (N, 13, 21, 20).
+    Creates all necessary temporary directories for a test run.
+    'scope="module"' means this runs only ONCE for all tests in this file.
     """
-    data_dir.mkdir(parents=True, exist_ok=True)
-    labels_dir.mkdir(parents=True, exist_ok=True)
-
-    for i in range(n_files):
-        rng = np.random.default_rng(1234 + i)
-        # [N, H, W, T]
-        sample = rng.random((DATA_SET_SIZE, INPUT_SHAPE_HW_C[0], INPUT_SHAPE_HW_C[1], TIME_LEN), dtype=np.float32)
-        flat = sample.reshape(DATA_SET_SIZE, -1)  # flatten to columns for parquet
-        cols = [str(j) for j in range(flat.shape[1])]
-        df_data = pd.DataFrame(flat, columns=cols)
-        df_data["event_id"] = np.arange(DATA_SET_SIZE)
-
-        labels = rng.random((DATA_SET_SIZE, len(LABELS)), dtype=np.float32)
-        df_lbl = pd.DataFrame(labels, columns=LABELS)
-        df_lbl["event_id"] = np.arange(DATA_SET_SIZE)
-
-        df_data.to_parquet(data_dir / f"recon3D_data_{i}.parquet", index=False)
-        df_lbl.to_parquet(labels_dir / f"labels_data_{i}.parquet", index=False)
-
-
-def _assert_nonempty_glob(pattern: str) -> list[str]:
-    files = glob.glob(pattern)
-    assert files, f"No files matched pattern: {pattern}"
-    return files
-
-
-@pytest.mark.timeout(300)
-def test_end_to_end_smoke(tmp_path: Path) -> None:
-    """
-    End-to-end smoke:
-      1) Generate small Parquet datasets
-      2) Instantiate DGs to write TFRecords (train/val)
-      3) Reload from TFRecords
-      4) Build a tiny model and run 1 epoch
-      5) Evaluate on validation generator
-    """
-
-    # --- Layout under tmp_path (auto-cleaned by pytest) ---
-    test_root = tmp_path
-    data_dir = test_root / "data"
-    labels_dir = test_root / "labels"
-    tfrecords_train = test_root / "tfrecords" / "train"
-    tfrecords_val = test_root / "tfrecords" / "validation"
-    base_model_dir = test_root / "base_model"
-
+    test_root = tmp_path_factory.mktemp("smoke_test_root")
+    paths = PipelinePaths(
+        data_dir=test_root / "data",
+        labels_dir=test_root / "labels",
+        tfrecords_train=test_root / "tfrecords" / "train",
+        tfrecords_val=test_root / "tfrecords" / "validation",
+        base_model_dir=test_root / "base_model",
+    )
     # Ensure directories exist
-    for d in (data_dir, labels_dir, tfrecords_train, tfrecords_val, base_model_dir):
+    for d in paths:
         d.mkdir(parents=True, exist_ok=True)
+    return paths
 
-    # 1) Generate tiny Parquet datasets
-    _generate_dummy_parquet(data_dir, labels_dir, n_files=max(TRAIN_FILE_COUNT, VAL_FILE_COUNT))
 
-    # Quick sanity
-    _assert_nonempty_glob(str(data_dir / "*.parquet"))
-    _assert_nonempty_glob(str(labels_dir / "*.parquet"))
+@pytest.fixture(scope="module")
+def generated_parquet_data(pipeline_paths: PipelinePaths) -> Path:
+    """
+    Depends on 'pipeline_paths'. Generates dummy Parquet files.
+    Yields the data directory path.
+    """
+    _generate_dummy_parquet(
+        pipeline_paths.data_dir,
+        pipeline_paths.labels_dir,
+        n_files=max(TRAIN_FILE_COUNT, VAL_FILE_COUNT)
+    )
+    _assert_nonempty_glob(str(pipeline_paths.data_dir / "part.*.parquet"))
+    return pipeline_paths.data_dir
+
+
+@pytest.fixture(scope="module")
+def written_tfrecords(pipeline_paths: PipelinePaths, generated_parquet_data: Path) -> TFRecordPaths:
+    """
+    Depends on 'pipeline_paths' and 'generated_parquet_data'.
+    Runs the DataGenerator in "writer" mode to create TFRecords.
+    """
+    # We use 'generated_parquet_data' to ensure data exists, but get paths from 'pipeline_paths'
+    data_dir = pipeline_paths.data_dir
+    tfrecords_train = pipeline_paths.tfrecords_train
+    tfrecords_val = pipeline_paths.tfrecords_val
 
     # 2) Instantiate DG to WRITE TFRecords
     train_writer = OptimizedDataGenerator(
-        data_directory_path=str(data_dir),
-        labels_directory_path=str(labels_dir),
-        is_directory_recursive=False,
-        file_type="parquet",
-        data_format="3D",
+        dataset_base_dir=str(data_dir),
         batch_size=BATCH_SIZE,
         file_count=TRAIN_FILE_COUNT,
         to_standardize=True,
-        include_y_local=False,
         labels_list=LABELS,
-        scaling_list=SCALINGS,
-        input_shape=(2, 13, 21),     # (C, H, W) as per your generator API
-        transpose=(0, 2, 3, 1),      # -> (C,H,W) -> (H,W,C) for Keras
+        input_shape=(2, 13, 21),  # (C, H, W) as per your generator API
+        transpose=(0, 2, 3, 1),  # -> (C,H,W) -> (H,W,C) for Keras
         files_from_end=False,
         shuffle=True,
         tfrecords_dir=str(tfrecords_train),
-        use_time_stamps=TIME_STAMPS,  # 2 time slices -> 2 channels
+        use_time_stamps=TIME_STAMPS,
         max_workers=1,
         seed=42,
-        quantize=True,
     )
 
     val_writer = OptimizedDataGenerator(
-        data_directory_path=str(data_dir),
-        labels_directory_path=str(labels_dir),
-        is_directory_recursive=False,
-        file_type="parquet",
-        data_format="3D",
+        dataset_base_dir=str(data_dir),
         batch_size=BATCH_SIZE,
         file_count=VAL_FILE_COUNT,
         to_standardize=True,
-        include_y_local=False,
         labels_list=LABELS,
-        scaling_list=SCALINGS,
         input_shape=(2, 13, 21),
         transpose=(0, 2, 3, 1),
         files_from_end=True,
@@ -176,25 +147,51 @@ def test_end_to_end_smoke(tmp_path: Path) -> None:
         use_time_stamps=TIME_STAMPS,
         max_workers=1,
         seed=43,
-        quantize=True,
     )
 
     # Ensure TFRecords were written
     _assert_nonempty_glob(str(tfrecords_train / "*.tfrecord*"))
     _assert_nonempty_glob(str(tfrecords_val / "*.tfrecord*"))
-
-    # Garbage collect writer instances (ensure no handles are open)
+    
+    # Garbage collect writer instances
     del train_writer, val_writer
 
+    return TFRecordPaths(train_dir=tfrecords_train, val_dir=tfrecords_val)
+
+
+# --- Test Functions (Now much smaller!) ---
+
+def test_data_generation(generated_parquet_data: Path):
+    """Tests that the parquet generation fixture ran successfully."""
+    assert generated_parquet_data.exists()
+    assert any(generated_parquet_data.glob("part.*.parquet"))
+    print("Dummy Parquet data generated.") # This won't show unless test fails or -rA is used
+
+def test_tfrecord_writing(written_tfrecords: TFRecordPaths):
+    """Tests that the TFRecord writing fixture ran successfully."""
+    assert written_tfrecords.train_dir.exists()
+    assert written_tfrecords.val_dir.exists()
+    assert any(written_tfrecords.train_dir.glob("*.tfrecord*"))
+    assert any(written_tfrecords.val_dir.glob("*.tfrecord*"))
+    print("TFRecords written successfully.")
+
+@pytest.mark.timeout(300)
+def test_model_training_and_evaluation(written_tfrecords: TFRecordPaths, pipeline_paths: PipelinePaths):
+    """
+    The final step:
+    1) Reloads DGs from the TFRecords created by the fixture.
+    2) Builds a tiny model.
+    3) Runs 1 epoch and evaluates.
+    """
     # 3) Reload DGs from TFRecords
     train_gen = OptimizedDataGenerator(
-        load_from_tfrecords_dir=str(tfrecords_train),
+        load_from_tfrecords_dir=str(written_tfrecords.train_dir),
         max_workers=1,
         seed=44,
         quantize=True,
     )
     val_gen = OptimizedDataGenerator(
-        load_from_tfrecords_dir=str(tfrecords_val),
+        load_from_tfrecords_dir=str(written_tfrecords.val_dir),
         max_workers=1,
         seed=45,
         quantize=True,
@@ -205,7 +202,7 @@ def test_end_to_end_smoke(tmp_path: Path) -> None:
     model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=custom_loss)
 
     # Lightweight callbacks to exercise code paths
-    ckpt_path = base_model_dir / "weights.{epoch:02d}-t{loss:.2f}-v{val_loss:.2f}.hdf5"
+    ckpt_path = pipeline_paths.base_model_dir / "weights.{epoch:02d}.hdf5"
     callbacks = [
         tf.keras.callbacks.EarlyStopping(patience=1, restore_best_weights=True),
         tf.keras.callbacks.ModelCheckpoint(
@@ -221,14 +218,61 @@ def test_end_to_end_smoke(tmp_path: Path) -> None:
         x=train_gen,
         validation_data=val_gen,
         epochs=NUM_EPOCHS,
-        shuffle=False,
+        shuffle=False,  # Shuffling is done in on_epoch_end / __getitem__
         verbose=0,
         callbacks=callbacks,
     )
+    
     # Basic sanity assertions
     assert history is not None
-    assert (base_model_dir.exists() and any(base_model_dir.iterdir())), "No checkpoint files created"
+    model_dir = pipeline_paths.base_model_dir
+    assert (model_dir.exists() and any(model_dir.glob("*.hdf5"))), "No checkpoint files created"
 
     # Evaluate — just check it returns a finite float
     val_loss = model.evaluate(val_gen, verbose=0)
     assert isinstance(val_loss, (float, np.floating)) and math.isfinite(float(val_loss))
+    print(f"Model trained and evaluated with final val_loss: {val_loss:.4f}")
+
+
+# --- Helper Functions (Unchanged) ---
+
+def _generate_dummy_parquet(data_dir: Path, labels_dir: Path, n_files: int) -> None:
+    """
+    Generate tiny dummy Parquet files the DG will actually find:
+    - Filenames: part.00000.parquet, part.00001.parquet, ...
+    - Columns: recon columns ("0".."H*W*T-1") + LABELS + event_id
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(n_files):
+        rng = np.random.default_rng(1234 + i)
+
+        # Recon volume [N, H, W, T] -> flatten to columns "0".. for parquet
+        sample = rng.random(
+            (DATA_SET_SIZE, INPUT_SHAPE_HW_C[0], INPUT_SHAPE_HW_C[1], TIME_LEN),
+            dtype=np.float32,
+        )
+        flat = sample.reshape(DATA_SET_SIZE, -1)
+        cols = [str(j) for j in range(flat.shape[1])]
+        df_data = pd.DataFrame(flat, columns=cols)
+        df_data["event_id"] = np.arange(DATA_SET_SIZE)
+
+        # Add labels into the SAME parquet file
+        labels = rng.random((DATA_SET_SIZE, len(LABELS)), dtype=np.float32)
+        for j, name in enumerate(LABELS):
+            df_data[name] = labels[:, j]
+
+        # File pattern the generator globs for
+        df_data.to_parquet(data_dir / f"part.{i:05d}.parquet", index=False)
+
+        # Optional: keep a separate labels file for debugging
+        df_lbl = pd.DataFrame(labels, columns=LABELS)
+        df_lbl["event_id"] = np.arange(DATA_SET_SIZE)
+        df_lbl.to_parquet(labels_dir / f"labels_data_{i}.parquet", index=False)
+
+
+def _assert_nonempty_glob(pattern: str) -> list[str]:
+    files = glob.glob(pattern)
+    assert files, f"No files matched pattern: {pattern}"
+    return files

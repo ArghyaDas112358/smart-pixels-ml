@@ -1,4 +1,4 @@
-# OptimizedDataGenerator_v2.py
+# OptimizedDataGenerator_v2p5.py
 import gc
 import glob
 import json
@@ -11,13 +11,23 @@ from typing import Any, Dict, List, Tuple, Union
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import utils
+import shutil
+from pathlib import Path
+
+# import utils
 from qkeras import quantized_bits
 from tqdm import tqdm
 
+
 # custom quantizer
 
-
+def safe_remove_directory(directory_path):
+    if Path(directory_path).exists():
+        print(f"Directory {directory_path} is removed...")
+        shutil.rmtree(directory_path)
+    else:
+        print(f"Directory {directory_path} does not exist and cannot be removed.")
+        
 # @tf.function
 def QKeras_data_prep_quantizer(data, bits=4, int_bits=0, alpha=1):
     """
@@ -162,7 +172,7 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
 
             if tfrecords_dir is None:
                 raise ValueError(f"tfrecords_dir is None")
-            utils.safe_remove_directory(tfrecords_dir)
+            safe_remove_directory(tfrecords_dir)
 
             self.tfrecords_dir = tfrecords_dir
             os.makedirs(self.tfrecords_dir, exist_ok=True)
