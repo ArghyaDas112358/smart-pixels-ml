@@ -33,6 +33,14 @@ from models.mlp_encoder_model_nonquantized import (
     Mlp_Full_SoftQuantizer,
     Mlp_Slim_SoftQuantizer,
 )
+from models.transformer_model_nonquantized import (
+    ViT_Max,
+    ViT_Full,
+    ViT_Slim,
+    ViT_Max_SoftQuantizer,
+    ViT_Full_SoftQuantizer,
+    ViT_Slim_SoftQuantizer,
+)
 from models.conv2d_model_quantized import (
     QConv2D_Max,
     QConv2D_Full,
@@ -63,6 +71,10 @@ model_list = {
 
     'Mlp_Full': [Mlp_Full, Mlp_Full_SoftQuantizer],
     'Mlp_Slim': [Mlp_Slim, Mlp_Slim_SoftQuantizer],
+
+    'ViT_Max': [ViT_Max, ViT_Max_SoftQuantizer],
+    'ViT_Full': [ViT_Full, ViT_Full_SoftQuantizer],
+    'ViT_Slim': [ViT_Slim, ViT_Slim_SoftQuantizer],
 
     'QConv2D_Max': [QConv2D_Max, QConv2D_Max_SoftQuantizer],
     'QConv2D_Full': [QConv2D_Full, QConv2D_Full_SoftQuantizer],

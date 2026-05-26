@@ -1,3 +1,7 @@
 .ipynb_checkpoints
 __pycache__
 config.json
+runs/
+legacy/
+julia_env/
+*.log

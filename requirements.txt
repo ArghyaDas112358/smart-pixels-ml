@@ -1,0 +1,26 @@
+# Fresh environment for smart-pixels-ml 2bit_optimization
+# Pinned to the legacy known-good combo (TF 2.15 uses Keras 2, required by QKeras).
+# Install into a fresh env, e.g.:
+#   mamba create -p /work/users/das214/envs/smartpix-2bit python=3.10 pip
+#   /work/users/das214/envs/smartpix-2bit/bin/pip install -r requirements.txt
+
+tensorflow[and-cuda]==2.15.1
+tensorflow-probability==0.23.0
+qkeras==0.9.0
+
+numpy==1.23.5
+pandas==1.5.3
+pyarrow==17.0.0
+scipy
+matplotlib==3.9.2
+seaborn==0.13.2
+natsort
+tqdm
+pyyaml
+
+# Notebook / kernel
+jupyter
+ipykernel
+
+# Codesign only (optional, needs licensed Catapult/Siemens toolchain to actually synthesize):
+# hls4ml
