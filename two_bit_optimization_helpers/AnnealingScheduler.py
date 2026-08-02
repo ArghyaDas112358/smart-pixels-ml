@@ -32,8 +32,10 @@ class AnnealingScheduler(tf.keras.callbacks.Callback):
     def on_train_begin(self, logs=None):
         try:
             self.layer = self.model.get_layer(self.target_layer_name)
-            if not isinstance(self.layer, SoftQuantizeLayer):
-                raise TypeError("Target layer must be a SoftQuantizeLayer.")
+            # duck-typed: any layer exposing an assignable `log_k` weight can be
+            # annealed (SoftQuantizeLayer, SoftRouterLayer, ...)
+            if not hasattr(self.layer, 'log_k'):
+                raise TypeError("Target layer must expose a 'log_k' weight.")
         except ValueError:
             raise ValueError(f"Layer '{self.target_layer_name}' not found in model.")
         
@@ -44,12 +46,12 @@ class AnnealingScheduler(tf.keras.callbacks.Callback):
         new_k = self.schedule_fn(epoch, **self.schedule_params)
         self.layer.log_k.assign([tf.math.log(tf.cast(new_k, tf.float32))])
 
-        current_levels = self.layer.levels.numpy()
-        levels_str = ", ".join([f"{level:.4f}" for level in current_levels])
-
         if self.verbose > 0:
             print(f"\nEpoch {epoch + 1}: Annealing 'k' set to {new_k:.4f}")
-            print(f"\tLevels: {levels_str}")
+            if hasattr(self.layer, 'levels'):  # SoftQuantizeLayer; router has none
+                current_levels = self.layer.levels.numpy()
+                levels_str = ", ".join([f"{level:.4f}" for level in current_levels])
+                print(f"\tLevels: {levels_str}")
 
     def _linear_schedule(self, epoch, total_epochs, initial_k=1.0, final_k=50.0):
         rate = tf.cast(epoch, tf.float32) / tf.cast(total_epochs, tf.float32)

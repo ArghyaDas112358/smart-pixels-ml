@@ -2,20 +2,20 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 import keras
 
-# custom loss function
-def custom_loss(y, p_base, minval=1e-9, maxval=1e9):
-    
+# custom loss function -- per-event (non-reduced) NLL vector, shape (B,)
+def custom_loss_perevent(y, p_base, minval=1e-9, maxval=1e9):
+
     p = p_base
-    
+
     mu = p[:, 0:8:2]
-    
+
     # creating each matrix element in 4x4
     Mdia = minval + tf.math.maximum(p[:, 1:8:2], 0.0)
     Mcov = p[:,8:]
-    
+
     # placeholder zero element
     zeros = tf.zeros_like(Mdia[:,0])
-    
+
     # assembles scale_tril matrix
     row1 = tf.stack([Mdia[:,0],zeros,zeros,zeros])
     row2 = tf.stack([Mcov[:,0],Mdia[:,1],zeros,zeros])
@@ -24,14 +24,19 @@ def custom_loss(y, p_base, minval=1e-9, maxval=1e9):
 
     scale_tril = tf.transpose(tf.stack([row1,row2,row3,row4]),perm=[2,0,1])
 
-    dist = tfp.distributions.MultivariateNormalTriL(loc = mu, scale_tril = scale_tril) 
-    
-    likelihood = dist.prob(y)  
+    dist = tfp.distributions.MultivariateNormalTriL(loc = mu, scale_tril = scale_tril)
+
+    likelihood = dist.prob(y)
     likelihood = tf.clip_by_value(likelihood,minval,maxval)
-    
+
     NLL = -1*tf.math.log(likelihood)
 
-    return tf.keras.backend.sum(NLL)
+    return NLL
+
+
+# custom loss function (sum over batch -- unchanged behaviour, used everywhere)
+def custom_loss(y, p_base, minval=1e-9, maxval=1e9):
+    return tf.keras.backend.sum(custom_loss_perevent(y, p_base, minval, maxval))
 
 # for FULL model (8 outputs)
 def custom_diag_loss(y, p_base, minval=1e-9, maxval=1e9):

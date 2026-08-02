@@ -696,12 +696,36 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
         TODO: prefetching (un-done)
         """
         tfrecord_path = self.tfrecord_filenames[batch_index]
-        raw_dataset = tf.data.TFRecordDataset(tfrecord_path)
-        parsed_dataset = raw_dataset.map(self._parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
-        # Get the first (and only) batch from the dataset
+        # MEMORY LEAK FIX (2026-08-02, credit Ben Weiss for spotting the cause).
+        # This used to build a fresh TFRecordDataset + .map(AUTOTUNE) + iterator on
+        # EVERY batch. Those register runtime resources (parallel-map thread pools
+        # and prefetch buffers) that Python's GC does not reclaim promptly, so
+        # memory grew linearly with epochs: measured ~170 MB/epoch here, which is
+        # ~4.4 MB x 39 files/epoch. It killed runs on a dedicated GPU at epoch ~253
+        # (47 GB) and ~123 (20 GB cap) -- half the memory, half the epochs, the
+        # signature of a linear leak. Severity is platform-dependent because
+        # AUTOTUNE sizes its buffers to the AVAILABLE CPU count, which is why the
+        # same code survived 5000 epochs on a shared-core node and died quickly on
+        # one with 64 dedicated cores.
+        #
+        # Fix: build each file's pipeline ONCE and keep a persistent iterator,
+        # cached BY PATH (not by batch_index -- on_epoch_end reshuffles the file
+        # ordering, so an index points at a different file each epoch).
+        # `.take(1).repeat()` makes the iterator inexhaustible while still always
+        # yielding that file's first batch, which is exactly what the old
+        # `next(iter(...))` returned.
+        iters = getattr(self, "_tfr_iters", None)
+        if iters is None:
+            iters = self._tfr_iters = {}
+        it = iters.get(tfrecord_path)
+        if it is None:
+            ds = tf.data.TFRecordDataset(tfrecord_path)
+            ds = ds.map(self._parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
+            it = iter(ds.take(1).repeat())
+            iters[tfrecord_path] = it
         try:
-            X_batch, y_batch = next(iter(parsed_dataset))
+            X_batch, y_batch = next(it)
         except StopIteration:
             raise ValueError(f"No data found in TFRecord file: {tfrecord_path}")
 
@@ -725,7 +749,8 @@ class OptimizedDataGenerator(tf.keras.utils.Sequence):
             X_batch = tf.gather(X_batch, shuffled_indices)
             y_batch = tf.gather(y_batch, shuffled_indices)
 
-        del raw_dataset, parsed_dataset
+        # (nothing to delete: the pipeline is now built once and cached, not
+        # rebuilt per batch -- see the leak note above)
         return X_batch, y_batch
             
     @staticmethod

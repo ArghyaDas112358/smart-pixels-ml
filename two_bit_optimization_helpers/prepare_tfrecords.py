@@ -23,15 +23,21 @@ def generate_tfrecords(
     model_type=None,
     labels_scale=None,
     test_only=False,
+    time_stamps_override=None,
 ):
     # determine labels_list
     if 'Slim' in model_type:
         labels_list=['x-midplane','y-midplane','cotBeta']
     else:
         labels_list=['x-midplane','y-midplane','cotAlpha','cotBeta']
-        
+
     # determine the time stamps to use
-    if timeslices==2:
+    # time_stamps_override: explicit time-sample indices for datasets whose time
+    # axis differs from the original 20-slice files (e.g. [0,100] is the
+    # first/last-sample analog of [0,19] for the 101-sample 10ps datasets).
+    if time_stamps_override is not None:
+        time_stamps = list(time_stamps_override)
+    elif timeslices==2:
         time_stamps=[0,19]
     elif timeslices==20:
         time_stamps=-1
