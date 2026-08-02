@@ -64,7 +64,7 @@ class PhysicsAnsatz(layers.Layer):
             descent solves by collapsing the symbolic to zero.
         """
         super().__init__(**kwargs)
-        if variant not in ('barycenter', 'localreco', 'blend'):
+        if variant not in ('barycenter', 'localreco', 'blend', 'pysr_aug'):
             raise ValueError(f"unknown variant {variant!r}")
         self.variant = variant
         self.p_x = float(fixed_pitch_x if fixed_pitch_x is not None else GEOMETRY['p_x'])
@@ -109,6 +109,19 @@ class PhysicsAnsatz(layers.Layer):
                 name='blend_logit_y', shape=(),
                 initializer=tf.constant_initializer(0.0), trainable=True,
             )
+        if self.variant == 'pysr_aug':
+            # alpha controls how strongly the PySR-discovered correction
+            # is applied per output; init 0.5 so it starts at half-strength
+            # and can either grow toward 1.0 (correction useful) or shrink
+            # toward 0 (correction harmful).
+            self.pysr_alpha = self.add_weight(
+                name='pysr_alpha', shape=(4,),
+                initializer=tf.constant_initializer([0.5, 0.5, 0.5, 0.5]),
+                trainable=True,
+            )
+            # Build the PySR correction sub-layer with its trainable constants.
+            from .pysr_correction import PySRCorrection
+            self.pysr_correction = PySRCorrection(name='pysr_correction')
         super().build(input_shape)
 
     def call(self, charge):
@@ -189,7 +202,9 @@ class PhysicsAnsatz(layers.Layer):
             y_local = ratio_y * (self.T * cotb_abs - (yL - yF)) / 2.0 + (yF + yL) / 2.0 + dy / 2.0
 
         # ---- variant assembly ----
-        if self.variant == 'barycenter':
+        if self.variant == 'barycenter' or self.variant == 'pysr_aug':
+            # pysr_aug uses the barycenter geometric prior; the PySR
+            # correction is added below in LABEL units.
             x_pred = x_bary
             y_pred = y_bary_corr
         elif self.variant == 'localreco':
@@ -207,4 +222,8 @@ class PhysicsAnsatz(layers.Layer):
         # massive scale changes (which gradient descent prefers to do by
         # collapsing the symbolic).
         raw = raw / self.labels_scale
+        if self.variant == 'pysr_aug':
+            # PySR-discovered correction in LABEL units, added after the
+            # labels_scale division so both terms are on the same scale.
+            raw = raw + self.pysr_alpha * self.pysr_correction(charge)
         return self.aff_scale * raw + self.aff_bias

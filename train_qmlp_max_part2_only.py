@@ -29,13 +29,13 @@ from train import create_model, train, save_performance_parquet, cleanup_models_
 
 DATASET = "/depot/cms/users/das214/datasets/largerWindowPreliminary/dataset_3sr_16x16_50x12P5_centeredIncidence_parquets"
 RUNS = "/work/users/das214/SmartPixels/smart-pixels-ml/runs"
-OUT = f"{RUNS}/vit_max_run_1000ep"
+OUT = f"{RUNS}/qmlp_max_run_full"
 WEIGHTS = f"{RUNS}/weights"
 PERF = f"{RUNS}/processed_parquets/test_3src/2bit_optimized"
 for d in (OUT, WEIGHTS, PERF):
     os.makedirs(d, exist_ok=True)
 
-MODEL_TYPE = "ViT_Max"
+MODEL_TYPE = "QMlp_Max"
 TIMESLICES = 2
 EPOCHS = 1000
 PATIENCE = 50
@@ -144,14 +144,11 @@ try:
                              model_type=MODEL_TYPE, train_type="2bit_optimized", fingerprint=fp2,
                              timeslices=TIMESLICES, soft_quantize_layer=False)
 
-    PART1_CKPT_DIR = "/work/users/das214/SmartPixels/smart-pixels-ml/runs/weights/weights-2t-ViT_Max-soft_quantize_layer-1a62cd8b-checkpoints"
     summary = {
         "model_type": MODEL_TYPE,
         "epochs_each_part": EPOCHS,
-        "part1_note": "Part 1 stopped early at epoch 522 (user decision); thresholds extracted there.",
-        "part1_best_val_loss": -43762.58,
-        "part1_best_checkpoint": thr_json.get("source_checkpoint"),
-        "part1_checkpoints": PART1_CKPT_DIR,
+        "part1_note": "No Part 1 for this Conv2D_Max standalone run; reused ViT_Max-derived Part-1 thresholds.",
+        "part1_thresholds_source": thr_json.get("source_checkpoint"),
         "part2_final_val_loss": float(h2.history["val_loss"][-1]),
         "part2_best_val_loss": float(min(h2.history["val_loss"])),
         "part2_epochs_run": len(h2.history["loss"]),

@@ -19,19 +19,24 @@ from loss import custom_loss
 from models.student_max import pack_14, apply_sign, teacher_signs
 
 MINVAL = 1e-9
+KL_DIAG_FLOOR = 1e-4   # relu-diag floor for KL numerical stability (matches
+                       # custom_loss's relu semantics; only the floor differs)
 
 
-def make_tril(v14, minval=MINVAL):
+def make_tril(v14, minval=KL_DIAG_FLOOR):
     """Slice a (B, 14) tensor (custom_loss layout) into mean (B,4) and
     lower-triangular Cholesky factor (B, 4, 4).
 
-    Uses softplus on the diagonal entries to guarantee strict positivity
-    for KL stability (custom_loss internally uses max(0,.); we keep the
-    same raw entries but apply a smoother positivity transform here so
-    near-zero raw values don't produce singular covariances during KL).
+    Diagonal transform MUST match loss.custom_loss (relu: minval+max(0,.))
+    so the KL reads the teacher/student covariance the SAME way the data-NLL
+    does. Using softplus here (the previous bug) blurred confident teacher
+    predictions -- distilling the student toward a washed-out teacher and
+    discarding the sharp 'dark knowledge'. We keep relu semantics and only
+    raise the floor to `minval` (default 0.02) for KL numerical stability,
+    which affects only the most extreme-confidence events.
     """
     mu = v14[..., 0:8:2]
-    diag = minval + tf.nn.softplus(v14[..., 1:8:2])
+    diag = minval + tf.maximum(v14[..., 1:8:2], 0.0)
     off = v14[..., 8:14]
     z = tf.zeros_like(diag[..., 0])
     row1 = tf.stack([diag[..., 0], z, z, z], axis=-1)
@@ -42,12 +47,25 @@ def make_tril(v14, minval=MINVAL):
     return mu, L
 
 
-def gaussian_kl(teacher_14, student_14):
-    """Mean KL[ N(mu_T, Sigma_T) || N(mu_S, Sigma_S) ] over the batch."""
+def gaussian_kl(teacher_14, student_14, reverse=False):
+    """Mean Gaussian KL over the batch.
+
+    reverse=False (default): forward KL[ teacher || student ] (mass-covering).
+      For a SHARP teacher + capacity-limited student this is pathological:
+      the student inflates its covariance to 'cover' the teacher, which raises
+      the data-NLL (the eval metric).
+    reverse=True: reverse KL[ student || teacher ] (mode-seeking). The student
+      places a sharp Gaussian at the teacher's peak and ignores what it cannot
+      represent -- the direction that protects the data-NLL (MiniLLM,
+      arXiv:2306.08543). Closed-form & differentiable for Gaussians, so it is a
+      free argument swap.
+    """
     mu_T, L_T = make_tril(teacher_14)
     mu_S, L_S = make_tril(student_14)
     d_T = tfp.distributions.MultivariateNormalTriL(loc=mu_T, scale_tril=L_T)
     d_S = tfp.distributions.MultivariateNormalTriL(loc=mu_S, scale_tril=L_S)
+    if reverse:
+        return tf.reduce_mean(tfp.distributions.kl_divergence(d_S, d_T))
     return tf.reduce_mean(tfp.distributions.kl_divergence(d_T, d_S))
 
 
