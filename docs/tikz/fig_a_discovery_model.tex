@@ -1,0 +1,113 @@
+% Fig A — SoftRouter DISCOVERY model (vertical tower), genre=blocks.
+% Source-verified against two_bit_optimization_helpers/models/transformer_model_nonquantized.py:
+%   PatchExtractor(3,4) -> 20 patches (16//3=5 x 16//4=4)   [:13-32, :90-93]
+%   PatchEncoder: Dense(64) + learnable pos-embed (added)   [:35-50]
+%   4x PRE-LN blocks: LN->MHA(4 heads, key_dim 64)->Drop -> +res ; LN->Dense(128,relu)->Drop->Dense(64)->Drop -> +res  [:54-68]
+%   head: LN -> Flatten(20*64=1280) -> Dense(64,relu) -> Dense(14)  [:95-99, ViT_Max output=14]
+% SoftRouterLayer per docs/soft_router_plan.md (planned layer; slot-softmax, k-annealed).
+% Simplification (noted in caption): Dropout(0.1) boxes omitted inside the block.
+\documentclass[border=6pt]{standalone}
+\usepackage{tikz}
+\usepackage{amsmath,amssymb}
+\usetikzlibrary{positioning, fit, backgrounds, arrows.meta, calc, shadows.blur, chains, decorations.pathreplacing, decorations.pathmorphing}
+\input{../genres/blocks/style.tex}
+
+\definecolor{abRouter}{RGB}{197,176,213}   % SoftRouterLayer (lavender)
+\definecolor{abQuant}{RGB}{149,212,196}    % SoftQuantizeLayer (teal)
+\definecolor{abAnneal}{RGB}{120,120,120}
+
+\begin{document}
+\sffamily
+\begin{tikzpicture}[node distance=4.5mm, font=\small]
+
+  % ======================= input: stack of time-slice frames =======================
+  \node[draw=black!70, fill=black!12, minimum size=10mm, inner sep=0pt] (f3) at (2.4mm, 1.8mm) {};
+  \node[draw=black!70, fill=black!25, minimum size=10mm, inner sep=0pt] (f2) at (1.2mm, 0.9mm) {};
+  \node[draw=black!70, fill=black, minimum size=10mm, inner sep=0pt]    (f1) at (0mm, 0mm) {};
+  \foreach \k in {-1,0,1}{\fill[white] ([xshift=\k*2.2mm-1.1mm,yshift=\k*2.2mm-1.1mm]f1.center) rectangle ++(2.2mm,2.2mm);}
+  \node[ab io, right=4mm of f3.east, align=left, font=\scriptsize]
+      {\textbf{pixel cluster}\\16$\times$16 px $\times$ 101 time samples};
+
+  % ======================= SoftRouterLayer =======================
+  \node[ab, fill=abRouter, minimum width=46mm, minimum height=9.5mm, font=\small\bfseries]
+      (router) at ($(f1.north)+(4mm,14mm)$) {SoftRouterLayer\\[-1pt]{\scriptsize\mdseries 2 selector slots over 101 slices}};
+  \draw[ab flow] (f2.north) -- node[right=1mm, font=\scriptsize] {$(16,16,101)$} (f2.north |- router.south);
+
+  % index read-off (right of router)
+  \node[rounded corners=2.5pt, draw=black!60, line width=0.6pt, align=center, fill=white,
+        font=\scriptsize, right=7mm of router.east] (readoff)
+        {after training:\\$[i_1,i_2]=\arg\max$\\$\to$ ASIC readout};
+  \draw[ab flow, dashed] (router.east) -- (readoff);
+
+  % ======================= SoftQuantizeLayer (JOINTLY optimized) =======================
+  \node[ab, fill=abQuant, minimum width=46mm, minimum height=9.5mm, font=\small\bfseries,
+        above=10mm of router] (quant)
+      {SoftQuantizeLayer\\[-1pt]{\scriptsize\mdseries 3 learnable thresholds $\to$ 4 levels (2-bit)}};
+  \draw[ab flow] (router) -- node[right=1mm, font=\scriptsize]
+      {$(16,16,2)$ mV — 2 selected slices} (quant);
+  \node[rounded corners=2.5pt, draw=black!60, line width=0.6pt, align=center, fill=white,
+        font=\scriptsize, right=7mm of quant.east] (adcnote)
+        {after training:\\thresholds $\to$ ADC\\{(learned \textbf{jointly}}\\{with the slices)}};
+  \draw[ab flow, dashed] (quant.east) -- (adcnote);
+
+  % one shared anneal pill driving BOTH layers
+  \node[rounded corners=2.5pt, draw=abAnneal, dashed, line width=0.6pt, align=center,
+        font=\scriptsize, inner sep=2.5pt] (anneal)
+        at ($(router.west)!0.5!(quant.west)+(-15mm,0)$)
+        {cosine anneal\\$k:1\!\to\!67$\\\textbf{both layers}};
+  \draw[ab flow, dashed, draw=abAnneal] (anneal.east) -- ++(2.5mm,0) |- (router.west);
+  \draw[ab flow, dashed, draw=abAnneal] (anneal.east) -- ++(2.5mm,0) |- (quant.west);
+
+  % ======================= patch embeddings =======================
+  \node[ab embed, minimum width=46mm, above=10mm of quant, font=\small\bfseries]
+      (pemb) {Patch Embeddings\\[-1pt]{\scriptsize\mdseries Dense(64) $+$ learnable pos.\ embed}};
+  \draw[ab flow] (quant) -- node[right=1mm, font=\scriptsize, align=left]
+      {$(16,16,2)$ levels $\{0,1,2,3\}$\\[-2pt]split $3{\times}4$ $\to$ 20 patches ($\times$24)} (pemb);
+
+  % ======================= 4x pre-LN transformer block =======================
+  % entry coordinate for residual taps
+  \coordinate (blkin) at ($(pemb.north)+(0,9mm)$);
+  \node[ab norm, minimum width=34mm] (ln1) at ($(blkin)+(0,5mm)$) {LayerNorm};
+  \coordinate (mhaat) at ($(ln1.north)+(0,8.5mm)$);
+  \abstacked{ab attn, minimum width=34mm}{mha}{mhaat}{Multi-Head Attention\\[-1pt]{\scriptsize\mdseries 4 heads $\cdot$ $d=64$}}
+  \node[ab dot] (add1) at ($(mha.north)+(0,7mm)$) {$+$};
+  \node[ab norm, minimum width=34mm] (ln2) at ($(add1.north)+(0,5.5mm)$) {LayerNorm};
+  \node[ab ff, minimum width=34mm] (ff) at ($(ln2.north)+(0,9mm)$)
+      {Feed Forward\\[-1pt]{\scriptsize\mdseries Dense 128 (ReLU) $\to$ Dense 64}};
+  \node[ab dot] (add2) at ($(ff.north)+(0,7mm)$) {$+$};
+
+  % main flow inside the block
+  \draw[ab flow] (pemb) -- node[right=1mm, font=\scriptsize] {$20\times 64$} (ln1);
+  \draw[ab flow] (ln1) -- (mha);
+  \draw[ab flow] (mha) -- (add1);
+  \draw[ab flow] (add1) -- (ln2);
+  \draw[ab flow] (ln2) -- (ff);
+  \draw[ab flow] (ff) -- (add2);
+
+  % residuals (pre-LN: tap BEFORE the LayerNorm), routed up the right side
+  \draw[ab res] (blkin) -- ++(24mm,0) |- (add1.east);
+  \coordinate (res2tap) at ($(add1.north)+(0,2mm)$);
+  \draw[ab res] (res2tap) -- ++(24mm,0) |- (add2.east);
+
+  % grey Nx backdrop
+  \begin{scope}[on background layer]
+    \node[ab stack, fit=(ln1)(mha-b2)(add1)(ln2)(ff)(add2), inner sep=5mm] (stack) {};
+  \end{scope}
+  \node[font=\small\bfseries, anchor=south west, text=black!60]
+      at ($(stack.south west)+(1.5mm,1mm)$) {$4\times$};
+
+  % ======================= head =======================
+  \node[ab norm, minimum width=34mm, above=8mm of stack.north] (lnf) {LayerNorm};
+  \draw[ab flow] (stack.north) -- node[right=1mm, font=\scriptsize] {$20\times 64$} (lnf);
+  \node[ab, minimum width=34mm, above=5.5mm of lnf] (flat) {Flatten};
+  \draw[ab flow] (lnf) -- (flat);
+  \node[ab ff, minimum width=34mm, above=6.5mm of flat] (d1) {Dense 64 $\cdot$ ReLU};
+  \draw[ab flow] (flat) -- node[right=1mm, font=\scriptsize] {$1280$} (d1);
+  \node[ab ff, minimum width=34mm, above=6.5mm of d1] (d2) {Dense 14 $\cdot$ linear};
+  \draw[ab flow] (d1) -- node[right=1mm, font=\scriptsize] {$64$} (d2);
+  \node[ab io, above=6.5mm of d2, align=center, font=\small\bfseries] (out)
+      {$\mu$ (4) $+$ covariance (10)\\[-1pt]{\scriptsize\mdseries $x,\ y,\ \cot\alpha,\ \cot\beta$ — full-cov.\ NLL}};
+  \draw[ab flow] (d2) -- node[right=1mm, font=\scriptsize] {$14$} (out);
+
+\end{tikzpicture}
+\end{document}

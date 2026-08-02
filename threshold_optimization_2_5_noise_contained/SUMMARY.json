@@ -1,0 +1,56 @@
+{
+ "study": "2-bit ADC threshold optimization (Part-1, ViT_Max + SoftQuantize) -- SINGLE 5000-epoch convergence run",
+ "date": "2026-06-30",
+ "dataset": "dataset_3srb_16x16_50x12P5_centeredIncidence_10ps_300k_convolved_to_200ps/shuffled_3d/TFR_files_2_5_noise_corr_contained",
+ "dataset_units": "mV (with sigma=4.64 mV Gaussian noise BAKED into the TFRs)",
+ "time_slices": "2t, samples [11,26] of the 101-sample 10ps waveform (200ps convolved) -- the '2 and 5' set",
+ "containment": "contained = original_atEdge == False (== rawElectronChargeOriginal_atEdge == 0); ~47% of events kept",
+ "config": {
+  "model": "ViT_Max + SoftQuantizeLayer",
+  "random_threshold_window": [25, 160],
+  "offset": 0.0,
+  "noise_at_load": "OFF (noise=-1) -- noise is already BAKED into the TFRs, not added at train time",
+  "baked_noise": "N(mu=0, sigma=4.64 mV)",
+  "epochs": 5000,
+  "early_stopping": "none (full 5000 to watch convergence)",
+  "k_anneal": "cosine 1->67 stretched over the full 5000 epochs",
+  "optimizer": "Nadam(1e-3)",
+  "loss": "custom_loss (NLL of multivariate Gaussian)",
+  "levels": [0, 1, 2, 3],
+  "seed": 42,
+  "init_thresholds": [84.25, 129.48, 140.91],
+  "note": "data scale max ~644 (matches prior new-3srb set), so the [25,160] window/offset=0 recipe ports directly"
+ },
+ "result": {
+  "RECOMMENDED_THRESHOLDS": [12.089616775512695, 22.715383529663086, 52.72528839111328],
+  "levels": [0, 1, 2, 3],
+  "best_epoch": 3914,
+  "best_val_loss_per_batch": -28004.125,
+  "final_val_loss_per_batch": -27045.125,
+  "wall_sec": 18478,
+  "basis": "best checkpoint of one long 5000-epoch run (not a multi-seed median)"
+ },
+ "convergence": {
+  "stable_over": "epochs 3500-5000 (final 30%)",
+  "T0_range": [11.93, 12.11],
+  "T1_range": [22.51, 22.75],
+  "T2_range": [52.49, 52.88],
+  "note": "each threshold stable to +-0.1..0.2 -- fully converged"
+ },
+ "comparison_to_clean_archive": {
+  "clean_offset0_median": [4.15, 13.013, 47.244],
+  "this_noisy": [12.09, 22.72, 52.73],
+  "interpretation": "all three shifted UP (T0 4->12, T1 13->23, T2 47->53) -- the sigma=4.64 mV baked noise raises thresholds off the noise floor for robustness; expected and intended"
+ },
+ "robustness_note": {
+  "stuck_init_guard": "this dataset's zero-likelihood ceiling is ~98,886, JUST under the old AbortOnStuck thr=1e5, so a stuck seed froze undetected for 379 epochs once. Fixed: thr=1e4 + flat-line (no-improvement-15-ep) detector + reseed loop. Seed 42 escaped on first try (0 stuck retries)."
+ },
+ "files": {
+  "data": "data/threshold_loss_epochs.csv (per-epoch loss/val_loss/T0/T1/T2 for all 5000 epochs)",
+  "best_model": "best_models/best_seed42.weights.hdf5 (+ config json, epoch 3914)",
+  "figs": "slides/figs/{loss_vs_epoch,thresholds_vs_epoch,threshold_stability_zoom}.png",
+  "slides": "slides/slides.md",
+  "scripts": "scripts/{make_tfrs_contained_2_5_noise,run_part1_long_2_5_noise_contained,make_plots_2_5_noise_contained}.py"
+ },
+ "units_note": "all NLL values are PER BATCH (sum over the 5000-event val batch), not per event"
+}

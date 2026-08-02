@@ -1,0 +1,68 @@
+% Fig C — PRODUCTION / VALIDATION model (vertical tower, compact), genre=blocks.
+% Source-verified: _vit_softquantizer in transformer_model_nonquantized.py:111-124
+%   Input(16,16,2) -> SoftQuantizeLayer(n_bits=2 -> 4 levels / 3 thresholds, k-annealed,
+%   name=soft_quantizer_output) -> _vit_backbone (same as Fig A; encoder shown as slab).
+% Head: LN -> Flatten(1280) -> Dense(64,relu) -> Dense(14).
+\documentclass[border=6pt]{standalone}
+\usepackage{tikz}
+\usepackage{amsmath,amssymb}
+\usetikzlibrary{positioning, fit, backgrounds, arrows.meta, calc, shadows.blur, chains, decorations.pathreplacing, decorations.pathmorphing}
+\input{../genres/blocks/style.tex}
+
+\definecolor{abQuant}{RGB}{149,212,196}   % SoftQuantizeLayer (teal)
+\definecolor{abAnneal}{RGB}{120,120,120}
+
+\begin{document}
+\sffamily
+\begin{tikzpicture}[node distance=4.5mm, font=\small]
+
+  % ======================= input: 2 selected slices =======================
+  \node[draw=black!70, fill=black!25, minimum size=10mm, inner sep=0pt] (f2) at (1.4mm, 1.1mm) {};
+  \node[draw=black!70, fill=black, minimum size=10mm, inner sep=0pt]    (f1) at (0mm, 0mm) {};
+  \foreach \k in {-1,0,1}{\fill[white] ([xshift=\k*2.2mm-1.1mm,yshift=\k*2.2mm-1.1mm]f1.center) rectangle ++(2.2mm,2.2mm);}
+  \node[ab io, right=4mm of f2.east, align=left, font=\scriptsize]
+      {\textbf{2 slices read out by the ASIC}\\indices $[i_1,i_2]$ from Fig.~A/B};
+
+  % ======================= SoftQuantizeLayer =======================
+  \node[ab, fill=abQuant, minimum width=46mm, minimum height=9.5mm, font=\small\bfseries]
+      (quant) at ($(f1.north)+(4mm,13mm)$)
+      {SoftQuantizeLayer\\[-1pt]{\scriptsize\mdseries 3 learnable thresholds $\to$ 4 levels (2-bit)}};
+  \draw[ab flow] (f1.north) ++(1mm,0) -- node[right=1mm, font=\scriptsize] {$(16,16,2)$ mV} ([xshift=-3mm]quant.south);
+
+  \node[rounded corners=2.5pt, draw=abAnneal, dashed, line width=0.6pt, align=center,
+        font=\scriptsize, inner sep=2.5pt, left=7mm of quant.west] (anneal)
+        {cosine anneal\\$k:1\!\to\!67$};
+  \draw[ab flow, dashed, draw=abAnneal] (anneal) -- (quant.west);
+  \node[rounded corners=2.5pt, draw=black!60, line width=0.6pt, align=center, fill=white,
+        font=\scriptsize, right=7mm of quant.east] (adcnote)
+        {after training:\\thresholds $\to$ \textbf{ADC}\\e.g.\ $[12.1,\,22.7,\,52.7]$ mV};
+  \draw[ab flow, dashed] (quant.east) -- (adcnote);
+
+  % ======================= patch embeddings =======================
+  \node[ab embed, minimum width=46mm, above=10mm of quant, font=\small\bfseries]
+      (pemb) {Patch Embeddings\\[-1pt]{\scriptsize\mdseries Dense(64) $+$ learnable pos.\ embed}};
+  \draw[ab flow] (quant) -- node[right=1mm, font=\scriptsize, align=left]
+      {$(16,16,2)$ levels $\{0,1,2,3\}$\\[-2pt]split $3{\times}4$ $\to$ 20 patches} (pemb);
+
+  % ======================= encoder slab =======================
+  \node[rounded corners=6pt, draw=black!60, line width=1.0pt, fill=abStack, align=center,
+        text=black!75, minimum height=15mm, minimum width=62mm, font=\normalsize\bfseries,
+        above=9mm of pemb] (enc)
+      {Transformer Encoder\\[-1pt]{\footnotesize\mdseries $4\times$ pre-LN blocks — expanded in Fig.~A}};
+  \draw[ab flow] (pemb) -- node[right=1mm, font=\scriptsize] {$20\times 64$} (enc);
+
+  % ======================= head =======================
+  \node[ab norm, minimum width=34mm, above=8mm of enc] (lnf) {LayerNorm};
+  \draw[ab flow] (enc) -- node[right=1mm, font=\scriptsize] {$20\times 64$} (lnf);
+  \node[ab, minimum width=34mm, above=5mm of lnf] (flat) {Flatten};
+  \draw[ab flow] (lnf) -- (flat);
+  \node[ab ff, minimum width=34mm, above=6mm of flat] (d1) {Dense 64 $\cdot$ ReLU};
+  \draw[ab flow] (flat) -- node[right=1mm, font=\scriptsize] {$1280$} (d1);
+  \node[ab ff, minimum width=34mm, above=6mm of d1] (d2) {Dense 14 $\cdot$ linear};
+  \draw[ab flow] (d1) -- node[right=1mm, font=\scriptsize] {$64$} (d2);
+  \node[ab io, above=6mm of d2, align=center, font=\small\bfseries] (out)
+      {$\mu$ (4) $+$ covariance (10)\\[-1pt]{\scriptsize\mdseries $x,\ y,\ \cot\alpha,\ \cot\beta$ — full-cov.\ NLL}};
+  \draw[ab flow] (d2) -- node[right=1mm, font=\scriptsize] {$14$} (out);
+
+\end{tikzpicture}
+\end{document}

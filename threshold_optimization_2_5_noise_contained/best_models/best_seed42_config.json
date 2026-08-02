@@ -1,0 +1,15 @@
+{
+ "model_type": "ViT_Max",
+ "soft_quantize_layer": true,
+ "timeslices": 2,
+ "input_shape": [2, 16, 16],
+ "thresholds": [12.089616775512695, 22.715383529663086, 52.72528839111328],
+ "levels": [0.0, 1.0, 2.0, 3.0],
+ "threshold_offset": 0.0,
+ "seed": 42,
+ "best_epoch": 3914,
+ "best_val_loss_per_batch": -28004.125,
+ "weights": "best_seed42.weights.hdf5",
+ "data": "/work/projects/SmartPixML/dataset_3srb_16x16_50x12P5_centeredIncidence_10ps_300k_convolved_to_200ps/shuffled_3d/TFR_files_2_5_noise_corr_contained",
+ "note": "load ViT_Max+SoftQuantize with these initial_thresholds/levels/offset, then load_weights() for inference without re-training"
+}

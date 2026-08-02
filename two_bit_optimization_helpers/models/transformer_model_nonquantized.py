@@ -2,6 +2,8 @@ import tensorflow as tf
 from tensorflow.keras import layers
 from tensorflow.keras.models import Model
 from SoftQuantizeLayer import SoftQuantizeLayer
+from SoftRouterLayer import SoftRouterLayer
+from SimpleRouterLayer import SimpleRouterLayer
 
 # Vision Transformer (ViT) ported verbatim from the legacy repo
 # (legacy/smart_pixels_ml/train_loop.py). The PatchExtractor / PatchEncoder /
@@ -126,12 +128,89 @@ def _vit_softquantizer(shape, output, initial_thresholds, threshold_offset,
     return Model(inputs=x_in, outputs=outputs, name="smrtpxl_vit")
 
 
+def _vit_softrouter(shape, output, initial_thresholds, threshold_offset,
+                    initial_levels=None, trainable_thresholds=True, num_slots=2):
+    """JOINT slice + threshold discovery model (docs/soft_router_plan.md, Fig A).
+
+    `shape` is the all-slice input (H, W, T=101). SoftRouterLayer selects
+    `num_slots` slices, SoftQuantizeLayer digitizes them, and BOTH are annealed
+    (two AnnealingSchedulers, same cosine) so slices and thresholds co-adapt.
+    The backbone is byte-identical to the production 2-slice model.
+    """
+    x_in = layers.Input(shape=shape, name="raw_input")
+    x = SoftRouterLayer(
+        num_slots=num_slots,
+        initial_k=1.0,
+        trainable_k=True,
+        name="soft_router_output",
+    )(x_in)
+    x = SoftQuantizeLayer(
+        n_bits=2,
+        initial_thresholds=initial_thresholds,
+        threshold_offset=threshold_offset,
+        initial_levels=initial_levels,
+        trainable_levels=False,
+        trainable_thresholds=trainable_thresholds,
+        initial_k=1.0,
+        trainable_k=True,
+        name="soft_quantizer_output",
+    )(x)
+    backbone_shape = (shape[0], shape[1], num_slots)
+    outputs = _vit_backbone(x, backbone_shape, output)
+    return Model(inputs=x_in, outputs=outputs, name="smrtpxl_vit_router")
+
+
+def _vit_simplerouter(shape, output, initial_thresholds, threshold_offset,
+                      initial_levels=None, trainable_thresholds=True, num_slots=2,
+                      anneal_beta=False):
+    """JOINT slice + threshold discovery model, SIMPLE variant (Option D).
+
+    Same anatomy as _vit_softrouter but the slice selector is SimpleRouterLayer
+    (exact pair-sampling gradient, Ahmed et al. ICLR 2023): NO router annealer —
+    only the downstream SoftQuantizeLayer is annealed. The backbone is
+    byte-identical to the production 2-slice model.
+    """
+    x_in = layers.Input(shape=shape, name="raw_input")
+    x = SimpleRouterLayer(
+        num_slots=num_slots,
+        anneal_beta=anneal_beta,
+        name="simple_router_output",
+    )(x_in)
+    x = SoftQuantizeLayer(
+        n_bits=2,
+        initial_thresholds=initial_thresholds,
+        threshold_offset=threshold_offset,
+        initial_levels=initial_levels,
+        trainable_levels=False,
+        trainable_thresholds=trainable_thresholds,
+        initial_k=1.0,
+        trainable_k=True,
+        name="soft_quantizer_output",
+    )(x)
+    backbone_shape = (shape[0], shape[1], num_slots)
+    outputs = _vit_backbone(x, backbone_shape, output)
+    return Model(inputs=x_in, outputs=outputs, name="smrtpxl_vit_simplerouter")
+
+
 # ---- Max (14 outputs, full covariance -> custom_loss) ----
 def ViT_Max(shape):
     return _vit_plain(shape, output=14)
 
 def ViT_Max_SoftQuantizer(shape, initial_thresholds, threshold_offset, initial_levels=None, trainable_thresholds=True):
     return _vit_softquantizer(shape, 14, initial_thresholds, threshold_offset, initial_levels, trainable_thresholds)
+
+def ViT_Max_SoftRouter(shape, initial_thresholds, threshold_offset, initial_levels=None, trainable_thresholds=True):
+    return _vit_softrouter(shape, 14, initial_thresholds, threshold_offset, initial_levels, trainable_thresholds)
+
+def ViT_Max_SimpleRouter(shape, initial_thresholds, threshold_offset, initial_levels=None, trainable_thresholds=True):
+    return _vit_simplerouter(shape, 14, initial_thresholds, threshold_offset, initial_levels, trainable_thresholds)
+
+def ViT_Max_SimpleRouterBeta(shape, initial_thresholds, threshold_offset, initial_levels=None, trainable_thresholds=True):
+    """SimpleRouter + annealable inverse temperature beta on the pair logits
+    (option O4). Separate entry point because the beta weight makes checkpoints
+    incompatible with plain ViT_Max_SimpleRouter runs."""
+    return _vit_simplerouter(shape, 14, initial_thresholds, threshold_offset, initial_levels,
+                             trainable_thresholds, anneal_beta=True)
 
 
 # ---- Full (8 outputs, diagonal covariance -> custom_diag_loss) ----

@@ -40,6 +40,9 @@ from models.transformer_model_nonquantized import (
     ViT_Max_SoftQuantizer,
     ViT_Full_SoftQuantizer,
     ViT_Slim_SoftQuantizer,
+    ViT_Max_SoftRouter,
+    ViT_Max_SimpleRouter,
+    ViT_Max_SimpleRouterBeta,
 )
 from models.conv2d_model_quantized import (
     QConv2D_Max,
@@ -56,8 +59,16 @@ from models.conv1d_model_quantized import (
     QConv1D_Slim_SoftQuantizer,
 )
 from models.mlp_encoder_model_quantized import (
+    QMlp_MoE_Max,
+    QMlp_MoE_Max_Distill,
+    QMlp_MoE_M,
+    QMlp_MoE_L,
+    QMlp_MoE_XL,
+    QMlp_MoE_ConvStem,
+    QMlp_Max,
     QMlp_Full,
     QMlp_Slim,
+    QMlp_Max_SoftQuantizer,
     QMlp_Full_SoftQuantizer,
     QMlp_Slim_SoftQuantizer,
 )
@@ -73,6 +84,14 @@ model_list = {
     'Mlp_Slim': [Mlp_Slim, Mlp_Slim_SoftQuantizer],
 
     'ViT_Max': [ViT_Max, ViT_Max_SoftQuantizer],
+    # joint slice+threshold discovery model: always built via the [1] slot
+    # (create_model(..., soft_quantize_layer=True, timeslices=101))
+    'ViT_Max_SoftRouter': [ViT_Max_SoftRouter, ViT_Max_SoftRouter],
+    # SIMPLE (Option D) slice+threshold discovery model: always built via the [1] slot
+    # (create_model(..., soft_quantize_layer=True, timeslices=101))
+    'ViT_Max_SimpleRouter': [ViT_Max_SimpleRouter, ViT_Max_SimpleRouter],
+    # O4: same, plus an annealable inverse temperature on the pair logits
+    'ViT_Max_SimpleRouterBeta': [ViT_Max_SimpleRouterBeta, ViT_Max_SimpleRouterBeta],
     'ViT_Full': [ViT_Full, ViT_Full_SoftQuantizer],
     'ViT_Slim': [ViT_Slim, ViT_Slim_SoftQuantizer],
 
@@ -83,6 +102,13 @@ model_list = {
     'QConv1D_Full': [QConv1D_Full, QConv1D_Full_SoftQuantizer],
     'QConv1D_Slim': [QConv1D_Slim, QConv1D_Slim_SoftQuantizer],
 
+    'QMlp_MoE_Max': [QMlp_MoE_Max, QMlp_MoE_Max],  # no SoftQuantizer variant (Part-1 thresholds fixed)
+    'QMlp_MoE_Max_Distill': [QMlp_MoE_Max_Distill, QMlp_MoE_Max_Distill],  # E2 DeiT separate-head (18 outputs)
+    'QMlp_MoE_M': [QMlp_MoE_M, QMlp_MoE_M],     # capacity sweep ~11K
+    'QMlp_MoE_L': [QMlp_MoE_L, QMlp_MoE_L],     # capacity sweep ~31K
+    'QMlp_MoE_XL': [QMlp_MoE_XL, QMlp_MoE_XL],  # capacity sweep ~85K
+    'QMlp_MoE_ConvStem': [QMlp_MoE_ConvStem, QMlp_MoE_ConvStem],  # conv-stem + attn-pool encoder (~10K)
+    'QMlp_Max': [QMlp_Max, QMlp_Max_SoftQuantizer],
     'QMlp_Full': [QMlp_Full, QMlp_Full_SoftQuantizer],
     'QMlp_Slim': [QMlp_Slim, QMlp_Slim_SoftQuantizer],
 }
@@ -130,15 +156,16 @@ def create_model(
 
 def train(
     model,
-    model_type, 
+    model_type,
     weights_directory,
     training_generator,
-    validation_generator, 
+    validation_generator,
     timeslices=2,
     train_type=None, # full_precision, soft_quantize_layer, 2bit_optimized
     epochs=1,
-    seed=10, 
-    verbose=1):
+    seed=10,
+    verbose=1,
+    extra_callbacks=None):
 
     if 'Max' in model_type:
         loss=custom_loss
@@ -180,32 +207,26 @@ def train(
     print('Model fingerprint: {}'.format(fingerprint))
 
     history = None
+    extra = list(extra_callbacks) if extra_callbacks else []
     if train_type == 'soft_quantize_layer':
         scheduler_callback = AnnealingScheduler(
-            schedule='cosine',  
-            target_layer_name='soft_quantizer_output', 
+            schedule='cosine',
+            target_layer_name='soft_quantizer_output',
             initial_k=1.0,
             final_k=67.0,
-            verbose=1      
+            verbose=1
         )
-    
-        history = model.fit(
-            x=training_generator,
-            validation_data=validation_generator,
-            callbacks=[mcp, scheduler_callback],
-            epochs=epochs,
-            shuffle=False,
-            verbose=verbose
-        )
+        callbacks = [mcp, scheduler_callback] + extra
     else:
-        history = model.fit(
-            x=training_generator,
-            validation_data=validation_generator,
-            callbacks=[mcp],
-            epochs=epochs,
-            shuffle=False,
-            verbose=verbose
-        )
+        callbacks = [mcp] + extra
+    history = model.fit(
+        x=training_generator,
+        validation_data=validation_generator,
+        callbacks=callbacks,
+        epochs=epochs,
+        shuffle=False,
+        verbose=verbose
+    )
     
     return weights_directory, fingerprint, history
     

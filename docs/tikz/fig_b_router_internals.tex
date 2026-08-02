@@ -1,0 +1,84 @@
+% Fig B — SoftRouterLayer INTERNALS (vertical tower, v2 clean layout), genre=blocks.
+% Spec source: docs/soft_router_plan.md (planned layer):
+%   W in R^{2x101}; k = exp(log_k), cosine 1->67 via AnnealingScheduler;
+%   a1 = softmax(k*W1); W2' = W2 + log(1-a1+eps); a2 = softmax(k*W2');
+%   soft: y_soft[..,s] = sum_t a_s[t] x[..,t];  hard: y_hard[..,s] = x[..,argmax a_s];
+%   y = stop_gradient(y_hard - y_soft) + y_soft  (STE, = SoftQuantizeLayer.py:186).
+\documentclass[border=6pt]{standalone}
+\usepackage{tikz}
+\usepackage{amsmath,amssymb}
+\usetikzlibrary{positioning, fit, backgrounds, arrows.meta, calc, shadows.blur, chains, decorations.pathreplacing, decorations.pathmorphing}
+\input{../genres/blocks/style.tex}
+
+\definecolor{abRouter}{RGB}{197,176,213}
+
+\begin{document}
+\sffamily
+\begin{tikzpicture}[font=\small]
+
+  % ======================= bottom: trainable logits =======================
+  \node[ab embed, minimum width=44mm] (wbox) at (0mm, 0mm)
+      {trainable slot logits\\[-1pt]$W \in \mathbb{R}^{2\times 101}$};
+
+  % ======================= slot columns =======================
+  \node[ab attn, minimum width=40mm, align=center] (sm1) at (-30mm, 22mm)
+      {Softmax$\big(k\cdot W_1\big)$\\[-1pt]{\scriptsize $k$ annealed $1\!\to\!67$ (cosine)}};
+  \node[ab op, minimum width=40mm, align=center] (mask) at (30mm, 22mm)
+      {duplicate mask\\[-1pt]{\scriptsize $W_2' = W_2 + \log(1-a_1+\varepsilon)$}};
+  \node[ab attn, minimum width=40mm, align=center] (sm2) at (30mm, 40mm)
+      {Softmax$\big(k\cdot W_2'\big)$\\[-1pt]{\scriptsize $k$ annealed $1\!\to\!67$ (cosine)}};
+
+  % W -> both columns (L-routes below the boxes; labels on the horizontal runs)
+  \draw[ab flow] (wbox.west) -- node[above, font=\scriptsize, pos=0.45] {$W_1$}
+      ++(-16mm,0) |- ($(sm1.south)+(0,-5mm)$) -- (sm1.south);
+  \draw[ab flow] (wbox.east) -- node[above, font=\scriptsize, pos=0.45] {$W_2$}
+      ++(16mm,0) |- ($(mask.south)+(0,-5mm)$) -- (mask.south);
+
+  % a1 across into the mask, and mask -> softmax2
+  \draw[ab flow] (sm1.east) -- node[above, font=\scriptsize] {$a_1$} (mask.west);
+  \draw[ab flow] (mask) -- (sm2);
+
+  % ======================= selection applied to x =======================
+  \node[ab op, minimum width=86mm, minimum height=11mm, align=center] (sel) at (0mm, 58mm)
+      {\textbf{apply selection to} $x$\\[-1pt]
+       {\scriptsize soft: $y_{\text{soft}}[:,:,s]=\sum_t a_s[t]\,x[:,:,t]$
+        \qquad hard: $y_{\text{hard}}[:,:,s]=x[:,:,\arg\max a_s]$}};
+
+  % a1 / a2 up into the selection box
+  \draw[ab flow] (sm1.north) -- node[right=0.5mm, font=\scriptsize, pos=0.35] {$a_1\ (101)$}
+      (sm1.north |- sel.south);
+  \draw[ab flow] (sm2.north) -- node[right=0.5mm, font=\scriptsize, pos=0.35] {$a_2\ (101)$}
+      (sm2.north |- sel.south);
+
+  % x enters the selection stage from the left
+  \node[ab io, align=center, font=\small\bfseries] (xin) at (-68mm, 58mm)
+      {$x$\\[-1pt]{\scriptsize\mdseries $(16,16,101)$}\\[-2pt]{\scriptsize\mdseries training only}};
+  \draw[ab flow] (xin.east) -- (sel.west);
+
+  % ======================= STE =======================
+  \node[ab ff, minimum width=64mm, minimum height=10mm, align=center, font=\small\bfseries]
+      (ste) at (0mm, 78mm)
+      {straight-through estimator\\[-1pt]
+       {\scriptsize\mdseries $y=\operatorname{stop\_grad}(y_{\text{hard}}-y_{\text{soft}})+y_{\text{soft}}$}};
+  \draw[ab flow] ($(sel.north)+(-14mm,0)$) --
+      node[left=0.5mm, font=\scriptsize, align=right] {$y_{\text{soft}}$\\[-2pt]gradients}
+      ($(ste.south)+(-14mm,0)$);
+  \draw[ab flow, dashed] ($(sel.north)+(14mm,0)$) --
+      node[right=0.5mm, font=\scriptsize, align=left] {$y_{\text{hard}}$\\[-2pt]forward value}
+      ($(ste.south)+(14mm,0)$);
+
+  % ======================= output =======================
+  \node[ab io, font=\small\bfseries, align=center] (yout) at (0mm, 94mm)
+      {$y\ (16,16,2)\ \longrightarrow$ ViT backbone\\[-1pt]
+       {\scriptsize\mdseries the backbone always consumes the hard 2-slice pick}};
+  \draw[ab flow] (ste) -- (yout);
+
+  % ======================= after-training extraction =======================
+  \node[rounded corners=2.5pt, draw=black!60, line width=0.6pt, align=center, fill=white,
+        font=\scriptsize] (extract) at (62mm, 78mm)
+      {\textbf{after anneal} ($k{=}67$):\\ $a_s \to$ one-hot\\[2pt]
+       $[i_1,i_2]=\arg\max_t W_s$\\ $\to$ \textbf{ASIC readout}};
+  \draw[ab flow, dashed] (sel.east) |- (extract.west);
+
+\end{tikzpicture}
+\end{document}
