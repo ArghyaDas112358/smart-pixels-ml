@@ -231,7 +231,18 @@ class SimpleRouterLogger(tf.keras.callbacks.Callback):
 
 
 def pred_stats(inner_model, x, y):
-    """(stds, corrs) of the deterministic predictions on one cached batch."""
+    """(stds, corrs) of the deterministic predictions on one cached batch.
+
+    This per-epoch diagnostic pass LEAKS ~122 MB/epoch on the Gautschi L40S --
+    isolated by bisecting the callbacks (profile_leak.py): the leak is present in
+    exactly the modes that run this pass, flat otherwise, and it survives the
+    data-generator fix, so it is a SECOND independent leak.
+
+    Passing `x` as a tf.Tensor rather than numpy is good practice but is NOT the
+    cause: an A/B (modes no_router vs mdmm_tensor) leaked at an identical
+    +122.1 MB/epoch either way. Root cause still unknown -- do not assume it is
+    the input handoff.
+    """
     preds = inner_model(x, training=False).numpy()
     stds, corrs = {}, {}
     for name, col in MDMM_OUTPUT_COLUMNS.items():
@@ -490,9 +501,13 @@ def main():
         if not a.sanity and not a.extend and len(conv) >= a.target:
             stamp("target already met -- nothing to do"); return
         tg,vg=load_tfrecords(TFR_TRAIN, TFR_TEST, noise=-1, seed=42)
-        # one cached val batch for the per-epoch MDMM diagnostics (numpy, fixed)
+        # One cached val batch for the per-epoch MDMM diagnostics. X is held as a
+        # tf.Tensor (tidier than re-converting numpy every epoch), y stays numpy
+        # for the correlation maths. NOTE: this does NOT fix the 122 MB/epoch
+        # leak in that diagnostic pass -- an A/B showed numpy and tensor input
+        # leak identically. See pred_stats().
         cx, cy = vg[0]
-        cbatch=(np.asarray(cx), np.asarray(cy))
+        cbatch=(tf.convert_to_tensor(np.asarray(cx)), np.asarray(cy))
         stamp(f"cached diagnostic batch: X{cbatch[0].shape} y{cbatch[1].shape}")
         for seed in seeds:
             if not a.extend and len(conv) >= a.target: break

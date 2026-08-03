@@ -27,8 +27,14 @@ from prepare_tfrecords import load_tfrecords
 from train import create_model
 
 pi = np.pi
-OUT = os.path.join(R, "runs", "perf_plots_mdmm"); os.makedirs(OUT, exist_ok=True)
-RUN = os.path.join(R, "runs", "simplerouter_mdmm_discovery")
+# Which campaign to plot. SMARTPIX_RUN_DIR / SMARTPIX_MODEL let the same script
+# serve the plain O11 runs and the O4/beta runs, whose checkpoints carry an extra
+# log_k weight and therefore need ViT_Max_SimpleRouterBeta to load at all.
+RUN = os.path.join(R, "runs", os.environ.get("SMARTPIX_RUN_DIR",
+                                             "simplerouter_mdmm_discovery"))
+MODEL = os.environ.get("SMARTPIX_MODEL", "ViT_Max_SimpleRouter")
+OUT = os.path.join(R, "runs", os.environ.get("SMARTPIX_PLOT_DIR", "perf_plots_mdmm"))
+os.makedirs(OUT, exist_ok=True)
 CKPT_SNAP = ("/tmp/claude-978920/-work-users-das214-SmartPixels/"
              "7a0a041e-b87d-47e5-ae22-8b5c100f4193/scratchpad/ckpt")
 BASE = "/work/projects/SmartPixML/dataset_3srb_16x16_50x12P5_centeredIncidence_10ps_300k_convolved_to_200ps/shuffled_3d"
@@ -60,7 +66,7 @@ def live_state(seed):
 
 def predict_df(weights):
     tf.keras.backend.clear_session(); gc.collect()
-    model = create_model('ViT_Max_SimpleRouter', timeslices=101, soft_quantize_layer=True,
+    model = create_model(MODEL, timeslices=101, soft_quantize_layer=True,
                          initial_thresholds=[1., 2., 3.], threshold_offset=0.0, initial_levels=LEVELS)
     model.load_weights(weights)
     router = model.get_layer('simple_router_output')
@@ -169,10 +175,34 @@ def make_summary(df, title, path):
 summary = {}
 for seed in SEEDS:
     st = live_state(seed)
-    snap = os.path.join(CKPT_SNAP, f"seed_{seed}.hdf5")
-    if not os.path.exists(snap):                       # fall back to the live file
+    # Read the LIVE best.weights.hdf5 by default. The snapshot copy is only for
+    # runs still training (where the trainer may rewrite the file mid-read) and
+    # is opt-in via SMARTPIX_USE_SNAP=1 -- silently preferring it produced plots
+    # from a stale mid-flight checkpoint while labelling them with the CURRENT
+    # epoch (seed 2042 rendered as "ep 5000" but was actually the epoch-1102
+    # weights, slices [53,63] instead of the true final [19,20]).
+    # SMARTPIX_CKPT=last|best. Default 'last' so the plotted model is the SAME
+    # state that result.json records (final_indices / final_thresholds) -- with
+    # 'best' the slides contradict themselves, e.g. seed 2042 is [19,20] in the
+    # results table but [24,53] at its best-val epoch.
+    which = os.environ.get("SMARTPIX_CKPT", "last")
+    fname = "last.weights.hdf5" if which == "last" else "best.weights.hdf5"
+    snap = os.path.join(RUN, f"seed_{seed}", fname)
+    if not os.path.exists(snap):
         snap = os.path.join(RUN, f"seed_{seed}", "best.weights.hdf5")
+    if os.environ.get("SMARTPIX_USE_SNAP") == "1":
+        cand = os.path.join(CKPT_SNAP, f"seed_{seed}.hdf5")
+        if os.path.exists(cand):
+            snap = cand
     df, idx, thr = predict_df(snap)
+    # Cross-check against the run's own record; a mismatch means stale weights.
+    rj = os.path.join(RUN, f"seed_{seed}", "result.json")
+    if os.path.exists(rj):
+        want = sorted(int(i) for i in json.load(open(rj)).get("final_indices", []))
+        if want and want != idx:
+            print(f"  WARNING seed {seed}: checkpoint slices {idx} != result.json "
+                  f"final_indices {want} (best-val epoch differs from the final "
+                  f"epoch, or the weights file is stale)", flush=True)
     tag = (f"seed {seed} @ ep {st['epoch']}/5000 — slices {idx}, "
            f"T=[{thr[0]:.1f}, {thr[1]:.1f}, {thr[2]:.1f}] mV, best NLL {st['best']:.0f}")
     print(f"\n===== {tag} =====", flush=True)
