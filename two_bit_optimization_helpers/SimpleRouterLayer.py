@@ -48,6 +48,7 @@ class SimpleRouterLayer(tf.keras.layers.Layer):
                  logits_init_stddev: float = 0.0,
                  seed=None,
                  anneal_beta: bool = False,
+                 smooth_logits: bool = False,
                  **kwargs):
         super(SimpleRouterLayer, self).__init__(**kwargs)
         assert num_slots == 2, "SimpleRouterLayer currently supports num_slots=2 only (k=2 pairs)."
@@ -67,6 +68,29 @@ class SimpleRouterLayer(tf.keras.layers.Layer):
         # OPT-IN ON PURPOSE: enabling it adds a weight, which would break
         # load_weights() for every checkpoint written by the beta-less runs.
         self.anneal_beta = anneal_beta
+        # smooth_logits: expose a NON-TRAINABLE `smooth_sigma` weight so a
+        # scheduler can convolve theta with a Gaussian along the SLICE AXIS
+        # before the pair softmax (option O15):
+        #     phi = (theta * k_sigma) / (1 * k_sigma),  p({a,b}) ~ exp(phi_a+phi_b)
+        # theta is 101 free scalars with NO metric between them -- the layer is
+        # invariant to shuffling the slice indices, so nothing says slice 45
+        # neighbours 46 and a gradient can only re-vote slice by slice, never
+        # SLIDE a preference along time. That is the suspected cause of the
+        # 86-117 distinct pairs per 200 epochs seen while mu stayed flat. The
+        # kernel couples neighbours: for a symmetric kernel convolution is
+        # self-adjoint, so dL/dtheta = k_sigma * dL/dphi and a gradient landing
+        # on slice 46 spreads to 45 and 47.
+        #
+        # sigma is ANNEALED TO EXACTLY 0, never held. Measured on real
+        # checkpoints: at sigma=1 the O13 solutions become inexpressible (the
+        # argmax pair changes and 60-70% of the top-2 mass is lost) because the
+        # slice-7 spike is genuinely one slice wide. So this is a coarse-to-fine
+        # SEARCH aid for early training, not a standing prior; at sigma=0 the
+        # layer is bit-identical to the un-smoothed one.
+        #
+        # OPT-IN like anneal_beta: it adds a weight, which would break
+        # load_weights() for checkpoints written without it.
+        self.smooth_logits = smooth_logits
 
     def build(self, input_shape):
         self.num_slices = int(input_shape[-1])
@@ -102,11 +126,50 @@ class SimpleRouterLayer(tf.keras.layers.Layer):
                 initializer=tf.keras.initializers.Zeros(),
                 trainable=False,
             )
+        # Gaussian smoothing width over the slice axis, driven by a scheduler
+        # (duck-typed on `smooth_sigma`, same hook pattern as log_k).
+        # sigma = 0 -> identity -> byte-identical to the un-smoothed layer.
+        if self.smooth_logits:
+            self.smooth_sigma = self.add_weight(
+                name='smooth_sigma',
+                shape=(1,),
+                initializer=tf.keras.initializers.Zeros(),
+                trainable=False,
+            )
+            d = np.arange(self.num_slices, dtype=np.float32)
+            self._dist2 = tf.constant((d[:, None] - d[None, :]) ** 2)   # (T,T)
         # all C(T,2) pairs (a<b), precomputed once
         ia, ib = np.triu_indices(self.num_slices, k=1)
         self.ia = tf.constant(ia, dtype=tf.int32)
         self.ib = tf.constant(ib, dtype=tf.int32)
         super(SimpleRouterLayer, self).build(input_shape)
+
+    def sigma(self):
+        """Current smoothing width in slices (0.0 when smoothing is disabled)."""
+        if not self.smooth_logits:
+            return tf.constant(0.0, dtype=tf.float32)
+        return tf.maximum(tf.reshape(self.smooth_sigma, []), 0.0)
+
+    def smooth(self, phi):
+        """phi -> (phi * k_sigma) / (1 * k_sigma) along the slice axis.
+
+        Implemented as a (T,T) row-normalised weight matrix rather than a conv so
+        the EDGE HANDLING is exact: each row is renormalised by the kernel mass
+        that actually lands in range, so slices near 0 and 100 are not dragged
+        toward zero the way plain zero-padded convolution would drag them. Slice
+        7 -- the one every O13 seed picked -- sits in that boundary region.
+        """
+        if not self.smooth_logits:
+            return phi
+        sg = self.sigma()
+
+        def _smoothed():
+            w = tf.exp(-self._dist2 / (2.0 * tf.square(sg)))
+            w = tf.where(self._dist2 <= tf.square(3.0 * sg), w, tf.zeros_like(w))
+            w = w / tf.reduce_sum(w, axis=1, keepdims=True)
+            return tf.linalg.matvec(w, phi)
+
+        return tf.cond(sg > 1e-6, _smoothed, lambda: phi)
 
     def beta(self):
         """Inverse temperature (1.0 when beta annealing is disabled)."""
@@ -153,7 +216,7 @@ class SimpleRouterLayer(tf.keras.layers.Layer):
         beta annealing is on), so mu always describes the distribution the layer
         actually samples from.
         """
-        phi = self.beta() * tf.convert_to_tensor(self.theta)
+        phi = self.smooth(self.beta() * tf.convert_to_tensor(self.theta))
         mu, _ = self._pair_stats(phi, self.num_slices)
         return tf.cast(mu, self.theta.dtype)
 
@@ -162,14 +225,19 @@ class SimpleRouterLayer(tf.keras.layers.Layer):
         return self.mu().numpy()
 
     def selected_indices(self):
-        """Ascending top-2 of theta as plain ints — the ASIC readout config."""
-        th = self.theta.numpy()
+        """Ascending top-2 of the EFFECTIVE logits — the ASIC readout config.
+
+        Must use the smoothed phi, not raw theta: the sampler and mu() both work
+        on phi, and reporting a pair from theta would disagree with the pair the
+        layer actually reads out whenever sigma > 0.
+        """
+        th = self.smooth(self.beta() * tf.convert_to_tensor(self.theta)).numpy()
         top2 = np.argsort(th)[-2:]
         return sorted(int(i) for i in top2)
 
     def call(self, inputs, training=None):
         beta = self.beta()
-        th = beta * tf.convert_to_tensor(self.theta)     # sharpened logits phi
+        th = self.smooth(beta * tf.convert_to_tensor(self.theta))   # sharpened+smoothed phi
 
         if training:
             # sample ONE pair per training step (shared across the batch)

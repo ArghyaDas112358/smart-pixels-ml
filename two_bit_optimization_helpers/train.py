@@ -43,6 +43,12 @@ from models.transformer_model_nonquantized import (
     ViT_Max_SoftRouter,
     ViT_Max_SimpleRouter,
     ViT_Max_SimpleRouterBeta,
+    ViT_Max_SimpleRouterSmooth,
+    ViT_MaxDeep_SimpleRouter,
+    ViT_MaxDeep_SimpleRouterSmooth,
+    ViT_MaxDeep_PairLattice,
+    ViT_MaxDeep_TwoRouterSmooth,
+    ViT_MaxDeep_UCBRouter,
 )
 from models.conv2d_model_quantized import (
     QConv2D_Max,
@@ -92,6 +98,12 @@ model_list = {
     'ViT_Max_SimpleRouter': [ViT_Max_SimpleRouter, ViT_Max_SimpleRouter],
     # O4: same, plus an annealable inverse temperature on the pair logits
     'ViT_Max_SimpleRouterBeta': [ViT_Max_SimpleRouterBeta, ViT_Max_SimpleRouterBeta],
+    'ViT_Max_SimpleRouterSmooth': [ViT_Max_SimpleRouterSmooth, ViT_Max_SimpleRouterSmooth],
+    'ViT_MaxDeep_SimpleRouter': [ViT_MaxDeep_SimpleRouter, ViT_MaxDeep_SimpleRouter],
+    'ViT_MaxDeep_SimpleRouterSmooth': [ViT_MaxDeep_SimpleRouterSmooth, ViT_MaxDeep_SimpleRouterSmooth],
+    'ViT_MaxDeep_PairLattice': [ViT_MaxDeep_PairLattice, ViT_MaxDeep_PairLattice],
+    'ViT_MaxDeep_TwoRouterSmooth': [ViT_MaxDeep_TwoRouterSmooth, ViT_MaxDeep_TwoRouterSmooth],
+    'ViT_MaxDeep_UCBRouter': [ViT_MaxDeep_UCBRouter, ViT_MaxDeep_UCBRouter],
     'ViT_Full': [ViT_Full, ViT_Full_SoftQuantizer],
     'ViT_Slim': [ViT_Slim, ViT_Slim_SoftQuantizer],
 
