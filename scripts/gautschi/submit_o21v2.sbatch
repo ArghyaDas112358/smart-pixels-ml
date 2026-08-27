@@ -73,7 +73,16 @@ if [[ -f $HIST ]]; then
     LAST=$(tail -1 "$HIST" | cut -d, -f1 | tr -d '\r')
     if [[ "$LAST" =~ ^[0-9]+$ ]] && (( LAST < TARGET_EPOCHS - 1 )); then
         echo "epoch $LAST < $((TARGET_EPOCHS-1)) -- resubmitting arm $ARM"
-        cd "$REPO" && ARM=$ARM sbatch scripts/gautschi/submit_o21v2.sbatch
+        # RESUBMIT GUARD: sbatch can be REFUSED (QOS job cap). The old line
+        # ignored its exit status, so the chain ended silently -- seeds 22042
+        # and 24142 each sat dead for hours that way. Retry, then shout.
+        for _try in 1 2 3 4 5; do
+            if cd "$REPO" && ARM=$ARM sbatch scripts/gautschi/submit_o21v2.sbatch; then
+                echo "resubmit ok (attempt $_try)"; break
+            fi
+            echo "RESUBMIT FAILED (attempt $_try) -- retrying in 120s"
+            if [ "$_try" = 5 ]; then echo "RESUBMIT GUARD: GIVING UP -- CHAIN DEAD"; else sleep 120; fi
+        done
     else
         echo "arm $ARM reached epoch $LAST -- done"
     fi

@@ -1,15 +1,18 @@
 """
-ViT_Max Part-2 (2-bit-optimized) training, 1000 epochs, picking up the
-charge thresholds from the partially-completed Part-1 of the 1000-epoch
-run (Part-1 was stopped at epoch 522/1000 with the user's blessing
-because val_loss + thresholds were already in a healthy regime).
+ViT_Max Part-2 (2-bit-optimized) training, up to 1000 epochs, picking up
+the charge thresholds from the partial Part-1 of the 1000-epoch run
+(Part 1 was stopped at epoch 522 by the user with thresholds already in
+a good regime).
 
-Reads thresholds from runs/vit_max_run_1000ep/optimized_thresholds.json
-(written by the partial extractor) and writes summary.json + history
-that match the v1 train_vit_max script's layout so the downstream
-chained watcher can pick up.
+Defenses against the known Part-2 plateau pathology (val_loss gets stuck
+at ~1e5 due to an unlucky random init): legacy-style AbortOnStuck
+callback aborts a run if val_loss stays > 1e5 for 5 epochs, and an
+outer retry loop re-seeds + rebuilds the model.
+
+Also stops cleanly once val_loss has not improved for 50 epochs
+(EarlyStopping(patience=50, restore_best_weights=True)).
 """
-import os, sys, json, csv, time, traceback
+import os, sys, json, csv, time, random, traceback
 sys.path.insert(0, "/work/users/das214/SmartPixels/smart-pixels-ml/two_bit_optimization_helpers")
 import numpy as np
 import tensorflow as tf
@@ -21,10 +24,8 @@ for g in tf.config.list_physical_devices("GPU"):
         pass
 print("GPUs:", tf.config.list_physical_devices("GPU"), flush=True)
 
-import shutil, random
 from prepare_tfrecords import generate_tfrecords, load_tfrecords
-from train import create_model, cleanup_models_and_generators, save_performance_parquet
-from loss import custom_loss
+from train import create_model, train, save_performance_parquet, cleanup_models_and_generators
 
 DATASET = "/depot/cms/users/das214/datasets/largerWindowPreliminary/dataset_3sr_16x16_50x12P5_centeredIncidence_parquets"
 RUNS = "/work/users/das214/SmartPixels/smart-pixels-ml/runs"
@@ -36,9 +37,36 @@ for d in (OUT, WEIGHTS, PERF):
 
 MODEL_TYPE = "ViT_Max"
 TIMESLICES = 2
-SEED = 42
 EPOCHS = 1000
-INIT_LVL = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+PATIENCE = 50
+STUCK_THRESHOLD = 1e5     # val_loss above this means the run is stuck
+STUCK_PATIENCE = 5
+MAX_RETRIES = 10
+
+
+class AbortOnStuck(tf.keras.callbacks.Callback):
+    """Stop training early if val_loss stays > `thr` for `patience` epochs."""
+    def __init__(self, threshold=1e5, patience=5):
+        super().__init__()
+        self.thr = threshold
+        self.pat = patience
+        self.bad = 0
+        self.aborted = False
+    def on_epoch_end(self, epoch, logs=None):
+        vloss = (logs or {}).get("val_loss", float("inf"))
+        if vloss > self.thr or not np.isfinite(vloss):
+            self.bad += 1
+            if self.bad >= self.pat:
+                print(f"[AbortOnStuck] val_loss {vloss:.1f} >= {self.thr} "
+                      f"for {self.pat} epochs - aborting this attempt.", flush=True)
+                self.aborted = True
+                self.model.stop_training = True
+        else:
+            self.bad = 0
+
+
+def stamp(m):
+    print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
 
 def save_hist(h, name):
@@ -49,10 +77,6 @@ def save_hist(h, name):
         w.writerow(["epoch"] + keys)
         for i in range(len(h.history[keys[0]])):
             w.writerow([i + 1] + [h.history[k][i] for k in keys])
-
-
-def stamp(m):
-    print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
 
 try:
@@ -66,51 +90,72 @@ try:
         dataset_dir=DATASET, model_type=MODEL_TYPE,
         train_batch_size=5000, val_batch_size=5000,
         select_contained=False, timeslices=TIMESLICES,
-        tfrecords_exist=True, seed=SEED,
+        tfrecords_exist=True, seed=42,
     )
     stamp("TFRecords ready")
 
-    stamp(f"=== PART 2: {MODEL_TYPE} 2bit-optimized, up to {EPOCHS} epochs with EarlyStopping(patience=50) ===")
-    tg2, vg2 = load_tfrecords(tfr_tr, tfr_val, noise=-1, digitize=True,
-                              digitize_levels=levels, digitize_thresholds=thresholds,
-                              seed=SEED)
-    m2 = create_model(MODEL_TYPE, timeslices=TIMESLICES, soft_quantize_layer=False)
-    m2.compile(optimizer=tf.keras.optimizers.Nadam(learning_rate=1e-3), loss=custom_loss)
-    fp2 = '%08x' % random.randrange(16 ** 8)
-    ckpt2 = f"{WEIGHTS}/weights-2t-{MODEL_TYPE}-2bit_optimized-{fp2}-checkpoints"
-    if os.path.exists(ckpt2):
-        shutil.rmtree(ckpt2)
-    os.makedirs(ckpt2)
-    cb_mcp = tf.keras.callbacks.ModelCheckpoint(
-        filepath=ckpt2 + '/weights.{epoch:02d}-t{loss:.2f}-v{val_loss:.2f}.hdf5',
-        save_weights_only=True, monitor='val_loss', save_best_only=False)
-    cb_early = tf.keras.callbacks.EarlyStopping(
-        monitor='val_loss', patience=50, restore_best_weights=True, verbose=1)
-    cb_csv = tf.keras.callbacks.CSVLogger(f"{OUT}/history_part2_2bit_optimized.csv", append=False)
-    stamp(f"checkpoints -> {ckpt2}")
-    stamp(f"fingerprint = {fp2}")
-    h2 = m2.fit(x=tg2, validation_data=vg2,
-                callbacks=[cb_mcp, cb_early, cb_csv],
-                epochs=EPOCHS, shuffle=False, verbose=1)
-    save_hist(h2, "history_part2_2bit_optimized")
-    stamp(f"Part 2 done at epoch {len(h2.history['loss'])} of {EPOCHS}.")
+    success = False
+    for attempt in range(1, MAX_RETRIES + 1):
+        seed = random.randint(0, 2**32 - 1)
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        stamp(f"=== PART 2 attempt {attempt}/{MAX_RETRIES}, seed={seed} ===")
+
+        tg2, vg2 = load_tfrecords(tfr_tr, tfr_val, noise=-1, digitize=True,
+                                  digitize_levels=levels, digitize_thresholds=thresholds,
+                                  seed=seed)
+        m2 = create_model(MODEL_TYPE, timeslices=TIMESLICES, soft_quantize_layer=False)
+
+        abort_cb = AbortOnStuck(threshold=STUCK_THRESHOLD, patience=STUCK_PATIENCE)
+        early_cb = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=PATIENCE,
+            restore_best_weights=True, verbose=1)
+
+        try:
+            ckpt2, fp2, h2 = train(
+                m2, MODEL_TYPE, WEIGHTS, tg2, vg2,
+                timeslices=TIMESLICES, train_type="2bit_optimized",
+                epochs=EPOCHS, seed=seed, verbose=1,
+                extra_callbacks=[abort_cb, early_cb],
+            )
+        except Exception as e:
+            stamp(f"attempt {attempt} raised: {e}")
+            cleanup_models_and_generators([m2, tg2, vg2])
+            continue
+
+        if abort_cb.aborted:
+            stamp(f"attempt {attempt} aborted (stuck). Retrying with new seed.")
+            cleanup_models_and_generators([m2, tg2, vg2])
+            continue
+
+        best_val = float(min(h2.history.get('val_loss', [float('inf')])))
+        stamp(f"attempt {attempt} succeeded. best val_loss = {best_val:.2f}, "
+              f"epochs run = {len(h2.history['loss'])}")
+        save_hist(h2, "history_part2_2bit_optimized")
+        success = True
+        break
+
+    if not success:
+        raise RuntimeError(f"Part 2 failed to escape the plateau after {MAX_RETRIES} attempts.")
 
     stamp("=== EVALUATE: performance parquet on 3sr test split ===")
     save_performance_parquet(checkpoints=ckpt2, output_directory=PERF, test_generator=vg2,
                              model_type=MODEL_TYPE, train_type="2bit_optimized", fingerprint=fp2,
                              timeslices=TIMESLICES, soft_quantize_layer=False)
 
-    # Combined summary: Part 1 info from the partial run + Part 2 info from now.
     PART1_CKPT_DIR = "/work/users/das214/SmartPixels/smart-pixels-ml/runs/weights/weights-2t-ViT_Max-soft_quantize_layer-1a62cd8b-checkpoints"
     summary = {
         "model_type": MODEL_TYPE,
         "epochs_each_part": EPOCHS,
-        "part1_note": "Part 1 was run 1000 epochs but stopped at epoch 522 (user decision); thresholds and best Part-1 checkpoint extracted from that point.",
+        "part1_note": "Part 1 stopped early at epoch 522 (user decision); thresholds extracted there.",
         "part1_best_val_loss": -43762.58,
         "part1_best_checkpoint": thr_json.get("source_checkpoint"),
         "part1_checkpoints": PART1_CKPT_DIR,
         "part2_final_val_loss": float(h2.history["val_loss"][-1]),
         "part2_best_val_loss": float(min(h2.history["val_loss"])),
+        "part2_epochs_run": len(h2.history["loss"]),
+        "part2_attempts": attempt,
         "optimized_thresholds": thr_json["thresholds"],
         "part2_checkpoints": ckpt2,
         "performance_dir": PERF,

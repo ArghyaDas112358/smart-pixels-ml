@@ -2,8 +2,11 @@
 # NOTE the `-l`: Slurm batch scripts run in a NON-login shell where Lmod is not
 # initialised and `module` does not exist.
 # ---------------------------------------------------------------------------
-# O21.v2a.2 (pair-lattice) and O21.v2c.2 (UCB bandit): the COLD, ZERO-PRIOR
-# proof runs.
+# O21.v3 (phi-logged): COLD ZERO-PRIOR runs on FRESH seeds, identical in every
+# training respect to submit_o21v2_cold.sbatch -- the ONLY difference is that
+# these start after the phi_history logger landed, so they carry the FULL
+# per-25-epoch record of the learned pair distribution from epoch 0. Separate
+# run dirs (o21v3*) so the in-flight v2cold runs are never touched.
 #
 # The question: does ViT_d (deep decoder) under loss v2 find the optimal slice
 # pair AND thresholds from scratch, with no inheritance from O17 or any earlier
@@ -18,12 +21,12 @@
 # Ran here rather than on the AF because the AF session came back on a ~3 GiB
 # GPU slice (was a full 40 GB A100) and cannot host a batch-5000 ViT_d worker.
 #
-# One arm+seed per job:  ARM=a SEED=22042 sbatch scripts/gautschi/submit_o21v2_cold.sbatch
+# One arm+seed per job:  ARM=a SEED=22042 sbatch scripts/gautschi/submit_o21v3_phi.sbatch
 #
 # MEMORY: SMARTPIX_GPU_MEM_MB caps TF to 20 GB. Do NOT also set
 # TF_GPU_ALLOCATOR=cuda_malloc_async -- it ignores the cap (see submit_o11).
 # ---------------------------------------------------------------------------
-#SBATCH --job-name=v2cold
+#SBATCH --job-name=v2phi
 #SBATCH -A cms
 #SBATCH -p smallgpu
 #SBATCH --gpus-per-node=1
@@ -38,20 +41,10 @@ REPO=$DEPOT/smart-pixels-ml
 VENV=$SCRATCH/envs/smartpix-2bit
 ARM=${ARM:?set ARM=a|c when submitting}
 SEED=${SEED:?set SEED=<n> when submitting}
-
-# BANDIT RETIRED (user decision 2026-08-20): only the pair-lattice arm is being
-# pursued. Arm c was consuming a third of the smallgpu per-user submit limit,
-# starving the lattice chains (three died silently in one night when their
-# resubmit was refused). Exit at once so any queued arm-c chunk frees its slot
-# and stops re-chaining. Delete this block to resume the bandit.
-if [ "$ARM" = "c" ]; then
-    echo "arm c (bandit) retired -- exiting without training"
-    exit 0
-fi
 TARGET_EPOCHS=10000
 case "$ARM" in
-  a) MODEL=ViT_MaxDeep_PairLattice; OUT=$REPO/runs/o21v2a2_pairlattice ;;
-  c) MODEL=ViT_MaxDeep_UCBRouter;   OUT=$REPO/runs/o21v2c2_ucb ;;
+  a) MODEL=ViT_MaxDeep_PairLattice; OUT=$REPO/runs/o21v3a_pairlattice_phi ;;
+  c) MODEL=ViT_MaxDeep_UCBRouter;   OUT=$REPO/runs/o21v3c_ucb_phi ;;
   *) echo "bad ARM=$ARM"; exit 1 ;;
 esac
 mkdir -p logs "$OUT"
@@ -94,7 +87,7 @@ if [[ -f $HIST ]]; then
         # ignored its exit status, so the chain ended silently -- seeds 22042
         # and 24142 each sat dead for hours that way. Retry, then shout.
         for _try in 1 2 3 4 5; do
-            if cd "$REPO" && ARM=$ARM SEED=$SEED sbatch scripts/gautschi/submit_o21v2_cold.sbatch; then
+            if cd "$REPO" && ARM=$ARM SEED=$SEED sbatch scripts/gautschi/submit_o21v3_phi.sbatch; then
                 echo "resubmit ok (attempt $_try)"; break
             fi
             echo "RESUBMIT FAILED (attempt $_try) -- retrying in 120s"

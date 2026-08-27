@@ -44,7 +44,7 @@ def best_checkpoint(ckpt_dir):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--variant', required=True,
-                   choices=['barycenter', 'localreco', 'blend'])
+                   choices=['barycenter', 'localreco', 'blend', 'pysr_aug'])
     p.add_argument('--teacher-checkpoints', required=True,
                    help='dir containing Part-2 .hdf5 checkpoints of the teacher')
     p.add_argument('--teacher-model-type', required=True,
