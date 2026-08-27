@@ -5,3 +5,14 @@ runs/
 legacy/
 julia_env/
 *.log
+
+# Figures copied to the repo root only so they could be downloaded from the
+# file browser; the originals live in backup_home/SmartPix/SoftQuantize.
+/*.gif
+/*.png
+
+# Evaluation mirrors and scratch checkouts
+runs/*_link
+runs/*_eval
+*.npz
+*.hdf5
