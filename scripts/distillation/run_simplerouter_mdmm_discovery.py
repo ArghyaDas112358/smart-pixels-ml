@@ -37,7 +37,7 @@ Usage:
   python run_simplerouter_mdmm_discovery.py --sanity          # 3-epoch GPU check
   python run_simplerouter_mdmm_discovery.py --epochs 1000 --target 6
 """
-import os, sys, json, time, glob, random, argparse, csv, re, traceback
+import os, sys, json, time, glob, random, argparse, csv, re, traceback, math
 
 # portable paths: derive from this file's location so the same script runs on
 # Purdue AF and on Gautschi (where /work/... does not exist). Override the data
@@ -68,11 +68,18 @@ for g in tf.config.list_physical_devices("GPU"):
             tf.config.experimental.set_memory_growth(g, True)
     except Exception: pass
 
+# SMARTPIX_CHECK_NUMERICS=1: insert CheckNumerics after every op so the FIRST
+# inf/nan tensor raises with the op that produced it (runs are seed-bit-exact,
+# so a NaN reproduces at the same epoch). Debug only -- large slowdown.
+if os.environ.get("SMARTPIX_CHECK_NUMERICS"):
+    tf.debugging.enable_check_numerics()
+
 from prepare_tfrecords import load_tfrecords
 from train import create_model
 from AnnealingScheduler import AnnealingScheduler
 from loss import custom_loss
-from mdmm import MDMM, MinCorrConstraint
+from conditional_nll import custom_loss_split, custom_loss_v2, nll_terms
+from mdmm import MDMM, MinCorrConstraint, MaxBlockNLLConstraint
 
 BASE = os.environ.get(
     "SMARTPIX_DATA_BASE",
@@ -101,11 +108,116 @@ MDMM_OUTPUT_COLUMNS = {"x": 0, "y": 2, "cotA": 4, "cotB": 6}
 MDMM_LABEL_COLUMNS = {"x": 0, "y": 1, "cotA": 2, "cotB": 3}
 MDMM_CONSTRAINT_SAMPLES = None            # None = full batch (exact estimate)
 
+# --- O12: constrain the conditional angle NLL instead of the correlation ------
+# Off by default, so every existing/queued run behaves EXACTLY as before.
+# ANGLE_NLL target is -log p(cotA,cotB | x,y) averaged over the batch, in the
+# same units as the task loss (see conditional_nll.py). Set from measurement,
+# not invented: runs/angle_block_measured.json holds the achievable frontier.
+CONSTRAINT_MODE = os.environ.get('SMARTPIX_CONSTRAINT', 'corr')   # 'corr' | 'anglenll'
+# Comma lists give ONE CONSTRAINT (and therefore one lambda) PER ENTRY, e.g.
+#   SMARTPIX_NLL_BLOCK='cotA,cotB'  SMARTPIX_ANGLE_NLL_TARGET='-0.15,-2.20'
+# O13 uses exactly that: a HARD target on cot alpha plus a LOOSE guard on cot
+# beta. With a single constraint on the pair block (O12) the model satisfied it
+# by improving cot beta while cot alpha got WORSE than O11's best seed
+# (+0.207 vs -0.044) -- separate multipliers remove that trade in both
+# directions, since neither angle can be paid for with the other.
+NLL_BLOCK = os.environ.get('SMARTPIX_NLL_BLOCK', 'cotA')
+ANGLE_NLL_TARGET = os.environ.get('SMARTPIX_ANGLE_NLL_TARGET', '0.0')
+NLL_BLOCKS = [b.strip() for b in NLL_BLOCK.split(',') if b.strip()]
+NLL_TARGETS = [float(t) for t in str(ANGLE_NLL_TARGET).split(',')]
+if len(NLL_TARGETS) == 1 and len(NLL_BLOCKS) > 1:
+    NLL_TARGETS = NLL_TARGETS * len(NLL_BLOCKS)
+assert len(NLL_TARGETS) == len(NLL_BLOCKS), \
+    f'need one target per block: {NLL_BLOCKS} vs {NLL_TARGETS}'
+# Events per batch, from the TFRecord MANIFEST (batch = 5000). Only used to put
+# the per-event constraint on the same footing as the summed task loss.
+BATCH = int(os.environ.get('SMARTPIX_BATCH', '5000'))
+# O20 warm-start probe: initialise backbone + head + thresholds from a trained
+# checkpoint while the router keeps its fresh init. WARM_SRC_MODEL is the
+# factory that WROTE the checkpoint (weight counts differ between router
+# variants, e.g. smooth_sigma), not the factory being trained.
+WARM_START = os.environ.get('SMARTPIX_WARM_START', '')
+WARM_SRC_MODEL = os.environ.get('SMARTPIX_WARM_SRC_MODEL', 'ViT_MaxDeep_SimpleRouter')
+# Loss v2 (O21.v2+): softplus diagonal, no clip -- see conditional_nll.py.
+# DIAG_MODE follows the loss so every diagnostic that interprets the raw diag
+# outputs (MDMMStateLogger's nll columns) reads the dialect the model is
+# actually being trained in; cross-dialect scoring is ~7 nats/event of pure
+# artifact. val_loss/history numbers under v2 are NOT comparable with the
+# clip-dialect O11..O21 ledger.
+LOSS_V2 = bool(os.environ.get('SMARTPIX_LOSS_V2', ''))
+DIAG_MODE = 'softplus' if LOSS_V2 else 'relu'
+# Ceiling on the effective Lagrange multiplier. '' = uncapped (O12/O13 original).
+# O13 without a cap: lambda reached ~30, penalty ~80,000 vs a task loss of
+# ~-13,000, and 2 of 3 seeds reversed cot alpha (-0.02 -> +0.38) and collapsed
+# onto the adjacent pair [7,8]. 25 holds the pressure without swamping the loss.
+LAMBDA_CAP = os.environ.get('SMARTPIX_LAMBDA_CAP', '')
+LAMBDA_CAP = float(LAMBDA_CAP) if LAMBDA_CAP else None
+# Ceiling on the infeasibility inside the penalty. The damping term scale*inf^2/2
+# has no lambda in it, so LAMBDA_CAP cannot bound it: a seed starting on the
+# clipped plateau has inf ~ 21 and a ~1.1e6 damping term that NaN'd seed 13442 on
+# epoch 2. '' = uncapped.
+INF_CAP = os.environ.get('SMARTPIX_INF_CAP', '')
+INF_CAP = float(INF_CAP) if INF_CAP else None
+
+# --- O15: annealed Gaussian kernel on the router logits ----------------------
+# SMARTPIX_SMOOTH_SIGMA0=4 SMARTPIX_SMOOTH_EPOCHS=1500 turns it on. sigma goes
+# sigma0 -> 0 on a cosine over SMOOTH_EPOCHS and is then held at EXACTLY 0, so
+# the run finishes as a plain SimpleRouter. Measured on real checkpoints: at
+# sigma=1 the sharp solutions become inexpressible, so the endpoint must be a
+# true zero and the anneal must finish with epochs to spare.
+SMOOTH_SIGMA0 = float(os.environ.get('SMARTPIX_SMOOTH_SIGMA0', '0') or 0)
+# Explicit model override (e.g. ViT_MaxDeep_SimpleRouter for the O17 deep-head
+# ablation). Takes precedence over the smooth/beta selection below. '' = off.
+MODEL_NAME_OVERRIDE = os.environ.get('SMARTPIX_MODEL_NAME', '')
+SMOOTH_EPOCHS = int(os.environ.get('SMARTPIX_SMOOTH_EPOCHS', '1500'))
+
+# --- fixed-slice ablation ----------------------------------------------------
+# SMARTPIX_FIX_SLICES='19,20' pins the router to one pair and FREEZES theta, so
+# the run measures what that pair can support rather than what the router can
+# find. Every run so far conflates the two: only 1 of 8 O11 seeds picked an early
+# pair, and it beat every late-slice seed on cot alpha by 0.36 nats -- suggestive
+# at n=1. theta = +30 on the two chosen slices makes the sampled pair
+# deterministic (p ~ 1 - 99*exp(-30)) on the training path and the top-2 on the
+# eval path, so both paths see exactly those slices.
+FIX_SLICES = os.environ.get('SMARTPIX_FIX_SLICES', '')
+FIX_PAIR = ([int(v) for v in FIX_SLICES.split(',')] if FIX_SLICES else None)
+# clip=True reproduces loss.custom_loss bit-for-bit (density clipped to
+# [1e-9,1e9]). clip=False is the untruncated NLL: the 0.16% worst-fit events stop
+# being capped at 20.72, and the dead-gradient plateau at init disappears.
+LOSS_CLIP = os.environ.get('SMARTPIX_LOSS_CLIP', '1') == '1'
+
+
+class SmoothSigmaScheduler(tf.keras.callbacks.Callback):
+    """sigma0 -> 0 on a cosine over `epochs`, then EXACTLY 0 for the rest.
+
+    Cosine (not linear) so the width falls fast through the useless-wide region
+    and lingers in the 0-1 range where the solution is actually resolved.
+
+    Set from the ABSOLUTE epoch, so a resumed run continues the schedule instead
+    of restarting it -- the same reason the quantizer anneal is pinned to a fixed
+    horizon rather than to --epochs.
+    """
+    def __init__(s, router, sigma0, epochs):
+        super().__init__(); s.r = router; s.s0 = float(sigma0); s.T = int(epochs)
+
+    def _sigma(s, ep):
+        if s.T <= 0 or ep >= s.T:
+            return 0.0
+        return s.s0 * 0.5 * (1.0 + math.cos(math.pi * ep / s.T))
+
+    def on_epoch_begin(s, epoch, logs=None):
+        s.r.smooth_sigma.assign([np.float32(s._sigma(epoch))])
+
 
 class AbortOnStuck(tf.keras.callbacks.Callback):
     """Stuck = val_loss above `thr` AND not improving for `patience` epochs.
 
-    thr=1e5 here, NOT the unconstrained study's 1e4: at init the NLL is fully
+    thr=9.9e4: the clipped init plateau is val_loss = 99,113.2, so a threshold of
+    1e5 sits just ABOVE it and a permanently-stuck seed is NEVER caught -- O11's
+    seed_42 and O12's seed_12042 both sat there burning a GPU slot. 9.9e4 sits
+    just below, so the plateau now counts as stuck while healthy seeds (which
+    leave it within a few epochs, well inside `patience`) are untouched.
+    NOT the unconstrained study's 1e4: at init the NLL is fully
     clipped (val ~99,113 -- likelihoods underflow the loss's 1e-9 clip, zero NLL
     gradient) and under MDMM the escape off that plateau is constraint-DRIVEN
     and gradual (corr rises epoch by epoch), not the unconstrained study's
@@ -113,7 +225,7 @@ class AbortOnStuck(tf.keras.callbacks.Callback):
     'bad' and every seed would be killed mid-escape at `patience` epochs. 1e5
     sits ABOVE the plateau (Harshul's exact setting, proven 5/6 on his MDMM
     campaign), so only true divergence (>1e5 or non-finite) aborts."""
-    def __init__(s, thr=1e5, patience=20, min_delta=1.0):
+    def __init__(s, thr=9.9e4, patience=20, min_delta=1.0):
         super().__init__(); s.thr=thr; s.pat=patience; s.min_delta=min_delta
         s.best=np.inf; s.bad=0; s.aborted=False
     def on_epoch_end(s, e, logs=None):
@@ -186,6 +298,17 @@ class SimpleRouterLogger(tf.keras.callbacks.Callback):
     def __init__(s, csv_path, npz_path, snap=SNAP, resume=False):
         super().__init__(); s.csv_path=csv_path; s.npz_path=npz_path; s.snap=snap
         s.snap_epochs=[]; s.snap_theta=[]; s.snap_mu=[]; s.snap_visits=[]
+        s.phi_path=os.path.join(os.path.dirname(npz_path), 'phi_history.npz')
+        s.snap_phi=[]; s.snap_phi_ep=[]
+        # phi_history carries its OWN epoch list: snap_epochs restarts empty on
+        # every chunk resume (theta_mu.npz is never written by these chains), so
+        # deriving phi's epochs from it desynchronised the two arrays.
+        if resume and os.path.exists(s.phi_path):      # keep prior phi snapshots
+            try:
+                z=np.load(s.phi_path)
+                s.snap_phi=list(z['phi']); s.snap_phi_ep=list(z['epochs'])
+            except Exception:
+                s.snap_phi=[]; s.snap_phi_ep=[]
         if resume and os.path.exists(s.npz_path):     # keep prior snapshots
             try:
                 z=np.load(s.npz_path)
@@ -197,7 +320,7 @@ class SimpleRouterLogger(tf.keras.callbacks.Callback):
         with open(s.csv_path,'w',newline='') as f:
             csv.writer(f).writerow(
                 ['epoch','i1','i2','theta_top5_idx','theta_top5_val',
-                 'mu_top5_idx','mu_top5_val','mu_entropy','visits_top5_idx'])
+                 'mu_top5_idx','mu_top5_val','mu_entropy','visits_top5_idx','sigma'])
     def on_epoch_end(s, epoch, logs=None):
         r=s.model.get_layer('simple_router_output')
         th=r.theta.numpy().astype(np.float64)
@@ -215,12 +338,27 @@ class SimpleRouterLogger(tf.keras.callbacks.Callback):
                 [epoch, i1, i2,
                  j(int(k) for k in tidx), j(f'{th[k]:.6g}' for k in tidx),
                  j(int(k) for k in midx), j(f'{mu[k]:.6g}' for k in midx),
-                 f'{ent:.6g}', j(int(k) for k in vidx)])
+                 f'{ent:.6g}', j(int(k) for k in vidx),
+                 f'{float(r.sigma()):.4g}'])
         if epoch % s.snap == 0:
             s.snap_epochs.append(epoch)
             s.snap_theta.append(th.astype(np.float32))
             s.snap_mu.append(mu.astype(np.float32))
             s.snap_visits.append(vis.astype(np.float32))
+            # PairLattice only: the FULL smoothed pair logits, so the learned
+            # 2-D distribution can be replayed per epoch instead of only at the
+            # end. Written incrementally (not in on_train_end, which never fires
+            # on the Gautschi chunk chains) and appended across resumes; ~20 kB
+            # per snapshot in float16, i.e. a few MB per 5000-epoch run.
+            if hasattr(r, 'psi'):
+                try:
+                    phi = r.smooth(tf.convert_to_tensor(r.psi)).numpy().astype(np.float16)
+                    s.snap_phi.append(phi); s.snap_phi_ep.append(epoch)
+                    np.savez_compressed(s.phi_path,
+                                        epochs=np.array(s.snap_phi_ep),
+                                        phi=np.stack(s.snap_phi))
+                except Exception:
+                    pass
     def on_train_end(s, logs=None):
         if s.snap_epochs:
             np.savez_compressed(s.npz_path,
@@ -263,20 +401,54 @@ class MDMMStateLogger(tf.keras.callbacks.Callback):
         s.csv_path=csv_path; s.constraints=constraints
         s.inner=inner_model; s.x=x; s.y=y
         names=list(MDMM_OUTPUT_COLUMNS)
+        # A run started before the per-target NLL columns existed has a NARROWER
+        # header. Appending the wider rows to it would silently corrupt the CSV,
+        # so detect that and keep emitting the old width for those runs.
+        # How many NLL columns the EXISTING header has: 0 (pre-dates them), 6
+        # (raw only), or 12 (raw + clipped). Emitting more than the header holds
+        # silently corrupts the CSV, and a run resumed under newer code must keep
+        # writing its original width.
+        s.n_nll = 12
         if resume and os.path.exists(s.csv_path) and os.path.getsize(s.csv_path)>0:
+            with open(s.csv_path) as f:
+                hdr = f.readline() or ''
+            s.n_nll = 12 if 'nll_angle_c' in hdr else (6 if 'nll_angle' in hdr else 0)
             return                                    # append to the existing log
         with open(s.csv_path,'w',newline='') as f:
             csv.writer(f).writerow(
                 ['epoch'] + [f'lmbda_{c.name}' for c in s.constraints] +
-                [f'pred_corr_{n}' for n in names] + [f'pred_std_{n}' for n in names])
+                [f'pred_corr_{n}' for n in names] + [f'pred_std_{n}' for n in names] +
+                # the four conditional NLL terms: where the joint loss is actually
+                # spent. Invisible in the fused scalar, and the quantity the O12
+                # constraint bounds (nll_angle = nll_cotA + nll_cotB).
+                ['nll_x','nll_y','nll_cotA','nll_cotB','nll_pos','nll_angle'] +
+                # same per-event bound the loss and the constraint use. The RAW
+                # columns show the degenerate regime (values ~1e36 while L's
+                # diagonal is on its 1e-9 floor); the _c columns show what the
+                # optimizer and lambda actually act on.
+                ['nll_x_c','nll_y_c','nll_cotA_c','nll_cotB_c','nll_pos_c','nll_angle_c'])
     def on_epoch_end(s, epoch, logs=None):
         stds, corrs = pred_stats(s.inner, s.x, s.y)
         lmb=[float(c.lmbda.numpy()) for c in s.constraints]
+        row = ([epoch] + [f'{v:.6g}' for v in lmb] +
+               [f'{corrs[n]:.6g}' for n in MDMM_OUTPUT_COLUMNS] +
+               [f'{stds[n]:.6g}' for n in MDMM_OUTPUT_COLUMNS])
+        if getattr(s, 'n_nll', 12):
+            _raw = nll_terms(tf.cast(s.y, tf.float64),
+                             tf.cast(s.inner(s.x, training=False), tf.float64),
+                             diag_mode=DIAG_MODE).numpy()
+            t = _raw.mean(0)
+            row += [f'{t[0]:.6g}',f'{t[1]:.6g}',f'{t[2]:.6g}',f'{t[3]:.6g}',
+                    f'{t[0]+t[1]:.6g}',f'{t[2]+t[3]:.6g}']
+            if getattr(s, 'n_nll', 12) >= 12:
+                LO, HI = -np.log(1e9), -np.log(1e-9)
+                tc = np.clip(_raw, LO, HI).mean(0)
+                pos_c = float(np.clip(_raw[:, 0] + _raw[:, 1], LO, HI).mean())
+                ang_c = float(np.clip(_raw[:, 2] + _raw[:, 3], LO, HI).mean())
+                row += [f'{tc[0]:.6g}',f'{tc[1]:.6g}',f'{tc[2]:.6g}',f'{tc[3]:.6g}',
+                        f'{pos_c:.6g}',f'{ang_c:.6g}']
         with open(s.csv_path,'a',newline='') as f:
-            csv.writer(f).writerow(
-                [epoch] + [f'{v:.6g}' for v in lmb] +
-                [f'{corrs[n]:.6g}' for n in MDMM_OUTPUT_COLUMNS] +
-                [f'{stds[n]:.6g}' for n in MDMM_OUTPUT_COLUMNS])
+            csv.writer(f).writerow(row)
 
 
 def last_logged_epoch(seed_dir):
@@ -301,8 +473,33 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
     # fallback for runs that predate it (costs a few epochs of progress).
     prev_ep=last_logged_epoch(OUT)
     ck_last=os.path.join(OUT,'last.weights.hdf5'); ck_best=os.path.join(OUT,'best.weights.hdf5')
-    resume_ck=ck_last if os.path.exists(ck_last) else (ck_best if os.path.exists(ck_best) else None)
+
+    def _usable_ckpt(p):
+        """True only if p is a checkpoint we can actually load.
+
+        A chunk killed mid-write (OOM, walltime, node eviction -- routine on the
+        leaky Gautschi GPUs) leaves a 0-byte or truncated .hdf5. Resume then
+        dies with `OSError: Unable to synchronously open file (file signature
+        not found)` BEFORE the first epoch, the sbatch tail sees no progress and
+        resubmits, and the seed crash-loops through the queue forever. Measured:
+        both seed-22042 arms of the cold campaign burned queue slots this way.
+        Validating here turns that into a clean fresh start.
+        """
+        if not p or not os.path.exists(p) or os.path.getsize(p) == 0:
+            return False
+        try:
+            import h5py
+            with h5py.File(p, 'r'):
+                return True
+        except Exception as e:
+            print(f'  [resume] ignoring unreadable checkpoint {os.path.basename(p)}: {e}', flush=True)
+            return False
+
+    resume_ck = ck_last if _usable_ckpt(ck_last) else (ck_best if _usable_ckpt(ck_best) else None)
     resume = prev_ep >= 0 and resume_ck is not None
+    if prev_ep >= 0 and resume_ck is None:
+        print(f'  [resume] epoch {prev_ep} logged but no usable checkpoint -- restarting this seed from scratch', flush=True)
+        prev_ep = -1
     initial_epoch = prev_ep+1 if resume else 0
     if resume and initial_epoch >= epochs:
         stamp(f"[seed {seed}] already at epoch {prev_ep} >= target {epochs} -- nothing to do")
@@ -313,18 +510,99 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
     else:
         stamp(f"[seed {seed}] thr0={[round(t,1) for t in thr0]}  -> fitting (max {epochs} ep, MDMM corr>={MDMM_MIN_CORR})")
 
-    model_name = 'ViT_Max_SimpleRouterBeta' if beta else 'ViT_Max_SimpleRouter'
+    if MODEL_NAME_OVERRIDE:
+        model_name = MODEL_NAME_OVERRIDE
+    elif SMOOTH_SIGMA0 > 0:
+        model_name = 'ViT_Max_SimpleRouterSmooth'
+    else:
+        model_name = 'ViT_Max_SimpleRouterBeta' if beta else 'ViT_Max_SimpleRouter'
     vit=create_model(model_name, timeslices=N_SLICES, soft_quantize_layer=True,
                      initial_thresholds=thr0, threshold_offset=0.0, initial_levels=LEVELS)
-    constraints=[
-        MinCorrConstraint(column=MDMM_OUTPUT_COLUMNS[p], label_column=MDMM_LABEL_COLUMNS[p],
-                          min_value=MDMM_MIN_CORR, scale=MDMM_SCALE, damping=MDMM_DAMPING,
-                          name=f"corr_{p}")
-        for p in MDMM_OUTPUT_COLUMNS
-    ]
+    if FIX_PAIR is not None:
+        _r = vit.get_layer('simple_router_output')
+        _v = np.full(N_SLICES, 0.0, dtype=np.float32)
+        for _i in FIX_PAIR:
+            _v[_i] = 30.0
+        _r.theta.assign(_v)
+        _r.trainable = False          # drops theta from trainable_variables
+        print(f'  [fix-slices] router pinned to {sorted(FIX_PAIR)}, theta frozen', flush=True)
+
+    if WARM_START and not resume:
+        # The probe asks whether a DEVELOPED early-slice representation flips
+        # the free router's preference, so the router must not inherit the
+        # checkpoint's theta (O17 checkpoints carry theta pinned +30 on the
+        # answer). Fresh starts only: chunk resumes reload their own
+        # last.weights via the resume path above.
+        # The main model is built first so its seed-determined init consumes
+        # the RNG in the same order as every other campaign; the src model is
+        # matched BY POSITION because Keras uniquifies auto-generated layer
+        # names across consecutive builds in one session.
+        src = create_model(WARM_SRC_MODEL, timeslices=N_SLICES, soft_quantize_layer=True,
+                           initial_thresholds=thr0, threshold_offset=0.0, initial_levels=LEVELS)
+        src.load_weights(WARM_START)
+        assert len(src.layers) == len(vit.layers), \
+            f'layer count mismatch: src {len(src.layers)} vs main {len(vit.layers)}'
+        theta_before = vit.get_layer('simple_router_output').theta.numpy().copy()
+        n_moved = 0
+        for sl, ml in zip(src.layers, vit.layers):
+            if ml.name.startswith('simple_router'):
+                continue
+            w = sl.get_weights()
+            if w:
+                ml.set_weights(w)
+                n_moved += 1
+        theta_after = vit.get_layer('simple_router_output').theta.numpy()
+        assert np.array_equal(theta_before, theta_after), 'router theta was touched by warm start'
+        del src
+        stamp(f"[seed {seed}] WARM START from {os.path.basename(WARM_START)} "
+              f"({WARM_SRC_MODEL}): {n_moved} weighted layers transferred, router theta fresh")
+        with open(os.path.join(OUT, 'warm_start.json'), 'w') as f:
+            json.dump({'src': WARM_START, 'src_model': WARM_SRC_MODEL,
+                       'layers_transferred': n_moved}, f)
+
+    if CONSTRAINT_MODE == 'anglenll':
+        # ONE constraint, on -log p(cotA,cotB | x,y). The four corr constraints are
+        # dropped on purpose: this subsumes them (a collapsed angle has a bad
+        # conditional NLL) and running both would confound the comparison. No
+        # lambda cap -- if the target is beyond what two 2-bit slices support the
+        # constraint stays infeasible and lambda climbs, which is the signal we
+        # want to see rather than hide.
+        # SCALE = batch size, NOT 1.0. The task loss is a SUM over the batch
+        # (loss.py uses K.sum, which is why NLL reads ~-30,000 not ~-5.9) while
+        # the constraint's fn is a per-event MEAN. Without this they differ by a
+        # factor of BATCH and lambda would be pushing against a loss 5,000x its
+        # size. Target stays in per-event nats so it is readable and matches
+        # runs/angle_block_measured.json.
+        constraints=[MaxBlockNLLConstraint(max_value=tv, block=bk,
+                                           scale=float(BATCH), damping=MDMM_DAMPING,
+                                           max_lambda=LAMBDA_CAP, inf_cap=INF_CAP,
+                                           name=f'nll_{bk}')
+                     for bk, tv in zip(NLL_BLOCKS, NLL_TARGETS)]
+    else:
+        constraints=[
+            MinCorrConstraint(column=MDMM_OUTPUT_COLUMNS[p], label_column=MDMM_LABEL_COLUMNS[p],
+                              min_value=MDMM_MIN_CORR, scale=MDMM_SCALE, damping=MDMM_DAMPING,
+                              name=f"corr_{p}")
+            for p in MDMM_OUTPUT_COLUMNS
+        ]
     model=MDMM(vit, constraints, constraint_samples=MDMM_CONSTRAINT_SAMPLES,
                constraint_pass='primary', name='mdmm_vit_router')
-    model.compile(optimizer=tf.keras.optimizers.Nadam(learning_rate=1e-3), loss=custom_loss)
+    # scale=1.0 for the NLL constraint: it is already in the task loss's units, so
+    # the 1e4 fudge MinCorr needed (correlation and NLL are not commensurate) is
+    # not just unnecessary here, it would swamp the objective.
+    # clip=True -> use the ORIGINAL custom_loss verbatim, so an O12 run is an
+    # apples-to-apples comparison with O11: identical objective, the constraint is
+    # the only difference. (custom_loss_split(clip=True) is proven bit-identical
+    # to it, but there is no reason to take even that risk.) clip=False switches
+    # to the untruncated NLL and IS a change of objective.
+    if LOSS_V2:
+        # O21.v2+: softplus diag, no clip. Overrides LOSS_CLIP entirely.
+        task_loss = custom_loss_v2
+        stamp(f"[seed {seed}] LOSS V2 (softplus diag, unclipped) -- NLLs not "
+              f"comparable with the clip-dialect O11..O21 ledger")
+    else:
+        task_loss = custom_loss if LOSS_CLIP else (lambda y, p: custom_loss_split(y, p, clip=False))
+    model.compile(optimizer=tf.keras.optimizers.Nadam(learning_rate=1e-3), loss=task_loss)
 
     if resume:
         model.load_weights(resume_ck)          # delegates to the inner ViT
@@ -365,7 +643,16 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
               f"(expected for runs started before opt-state checkpointing)")
 
     cx, cy = cbatch
-    stuck=AbortOnStuck()
+    # O15: drive the router's smoothing width. Only exists when the model was
+    # built with smooth_logits=True, i.e. when SMARTPIX_SMOOTH_SIGMA0 > 0.
+    smooth_cb=([SmoothSigmaScheduler(vit.get_layer('simple_router_output'),
+                                     SMOOTH_SIGMA0, SMOOTH_EPOCHS)]
+               if SMOOTH_SIGMA0 > 0 else [])
+    # SMARTPIX_ABORT_THR: the default 9.9e4 is calibrated to the CLIP-dialect
+    # plateau (val 99,113). Under loss v2 there is no cap and val legitimately
+    # spikes past it (e.g. the UCB sweep scoring mismatched pairs), so v2 runs
+    # set this huge -- the non-finite (NaN) abort path still protects them.
+    stuck=AbortOnStuck(thr=float(os.environ.get('SMARTPIX_ABORT_THR', '9.9e4')))
     cbs=[SimpleRouterLogger(os.path.join(OUT,'router_epochs.csv'),
                             os.path.join(OUT,'theta_mu.npz'), resume=resume),
          MDMMStateLogger(os.path.join(OUT,'mdmm_epochs.csv'), constraints, vit, cx, cy,
@@ -380,6 +667,7 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
                 'cosine', target_layer_name='simple_router_output',
                 initial_k=1.0, final_k=beta['final'], verbose=0,
                 anneal_epochs=beta['epochs'], start_epoch=beta['start'])] if beta else []),
+         *smooth_cb,
          # save_weights delegates to the inner ViT -> checkpoint loads into a
          # plain create_model for eval, exactly like the unconstrained study.
          tf.keras.callbacks.ModelCheckpoint(os.path.join(OUT,'best.weights.hdf5'),

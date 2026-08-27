@@ -142,8 +142,14 @@ class MinCorrConstraint(OutputConstraint):
         p_c = p - tf.reduce_mean(p)
         t_c = t - tf.reduce_mean(t)
         cov = tf.reduce_mean(p_c * t_c)
-        denom = tf.math.reduce_std(p) * tf.math.reduce_std(t) + 1e-6
-        return cov / denom
+        # sqrt(var + eps), NOT reduce_std: d(std)/dp is 0/0 = NaN at zero
+        # variance, and zero variance is reachable -- on the clip plateau the
+        # corr penalty is the ONLY gradient, and Pearson's scale invariance
+        # leaves sd(pred) free to drift to 0 (NaN'd O18 seed 18042 at epoch 4).
+        # The 1e-6 on the denominator only guards the forward pass.
+        sd_p = tf.sqrt(tf.math.reduce_variance(p) + 1e-12)
+        sd_t = tf.sqrt(tf.math.reduce_variance(t) + 1e-12)
+        return cov / (sd_p * sd_t + 1e-6)
 
     def infeasibility(self, fn_value):
         return tf.math.maximum(self.min_value - fn_value, 0.0)
@@ -151,6 +157,104 @@ class MinCorrConstraint(OutputConstraint):
     def call(self, outputs, y_true=None):
         inf = self.infeasibility(self.fn(outputs, y_true=y_true))
         l_term = tf.math.maximum(self.lmbda, 0.0) * inf
+        damp_term = self.damping * tf.square(inf) / 2
+        return self.scale * (l_term + damp_term)
+
+
+class MaxBlockNLLConstraint(OutputConstraint):
+    """mean(-log p(block | earlier targets)) <= max_value, on the split NLL.
+
+    Constrains the PHYSICS quantity rather than a proxy. Two properties the
+    correlation floor does not have:
+
+      * it cannot be met by faking confidence -- spreading the predictions
+        wrongly enlarges z^2, which raises the NLL, and
+      * it cannot be met by hedging -- inflating L_kk pays the log L_kk term.
+
+    Correlation is invariant to affine rescaling, so it happily passes a model
+    whose angle predictions span a few percent of the true range (measured:
+    seed 4042 clears corr >= 0.5 at sd(pred)/sd(true) = 0.06). The conditional
+    NLL has no such blind spot.
+
+    `block` is 'angle' (terms 2+3 = -log p(cotA,cotB | x,y)), 'position' (0+1),
+    or a single target: 'x', 'y', 'cotA', 'cotB' (or its index).
+
+    MEASURED 2026-08-03 on the full 37,919-event validation set, the ANGLE BLOCK
+    barely discriminates -- seed 2042 beats 4042 by 0.047 nats, because the seeds
+    trade the two angles against each other (2042 is 0.374 better on cotA and
+    0.326 worse on cotB). 'cotA' separates them cleanly instead: -0.044 for 2042
+    against +0.319..+0.397 for the rest. Prefer block='cotA'.
+
+    'cotA' is also unambiguous: term 2 is conditioned ONLY on x,y with nothing
+    downstream, so unlike cotB it does not depend on the chain order.
+
+    If the target is below what two 2-bit slices can support the constraint is
+    infeasible and lambda climbs without bound -- which is informative: sweep
+    max_value and the divergence point locates the information ceiling. Cap
+    lambda when running such a sweep.
+    """
+    needs_truth = True
+
+    def __init__(self, max_value, block='angle', scale=1.0, damping=1.0,
+                 minval=1e-9, maxval=1e9, max_lambda=None, inf_cap=None, **kwargs):
+        super().__init__(scale=scale, damping=damping, **kwargs)
+        self.max_value = max_value
+        self.block = block
+        self.minval = minval
+        self.maxval = maxval
+        # Ceiling on the EFFECTIVE multiplier. Without one, an unreachable target
+        # makes lambda climb forever: measured 2026-08-04 on O13 seeds 13042/13142
+        # at lambda ~30, the penalty (scale * lambda * gap) reached ~80,000 against
+        # a task loss of ~-13,000, and both seeds destroyed their own likelihood --
+        # cot alpha reversed -0.02 -> +0.38 and the router collapsed onto the
+        # adjacent pair [7,8]. Seed 13342 escaped only by reaching the target,
+        # which stops lambda growing. The cap keeps the pressure without letting
+        # the constraint swamp the objective.
+        self.max_lambda = max_lambda
+        # Ceiling on the INFEASIBILITY used in the penalty. The damping term is
+        # scale * inf^2 / 2 and carries NO lambda, so a lambda cap cannot bound it.
+        # Measured 2026-08-04 (O13 seed 13442): a seed that starts on the clipped
+        # plateau has both angle terms pinned at the 20.72 ceiling, so inf ~ 21 and
+        # the damping term alone is 5000 * 21^2 / 2 ~ 1.1e6 per constraint -- 23x
+        # the task loss. The gradients NaN'd the model on epoch 2. Capping inf
+        # keeps early pressure gentle and lets the NLL drive the escape, exactly as
+        # it does in the corr-constrained runs where inf is bounded by 1.5 anyway.
+        self.inf_cap = inf_cap
+
+    def fn(self, outputs, y_true=None):
+        from conditional_nll import nll_terms
+        # float64 THROUGHOUT. At initialisation L's diagonal sits on its 1e-9
+        # floor, so z = L^-1 (y-mu) divides by 1e-9 and the terms reach ~1e73;
+        # in float32 that is +inf for ~23% of events.
+        t = nll_terms(tf.cast(y_true, tf.float64), tf.cast(outputs, tf.float64))
+        NAMED = {'x': 0, 'y': 1, 'cotA': 2, 'cotB': 3}
+        if self.block == 'angle':
+            v = t[:, 2] + t[:, 3]
+        elif self.block == 'position':
+            v = t[:, 0] + t[:, 1]
+        else:
+            v = t[:, NAMED[self.block] if self.block in NAMED else int(self.block)]
+        # SAME per-event bound loss.custom_loss imposes by clipping the density to
+        # [minval, maxval] before the log. Without it the infeasibility at init is
+        # ~1e70 and the damping term scale*inf^2/2 overflows float32 -> NaN on the
+        # very first batch (observed 2026-08-03). With it, the block at init reads
+        # 20.55 against custom_loss's own 20.59 -- the same regime, bounded.
+        lo = -tf.math.log(tf.constant(self.maxval, tf.float64))
+        hi = -tf.math.log(tf.constant(self.minval, tf.float64))
+        v = tf.clip_by_value(v, lo, hi)
+        return tf.cast(tf.reduce_mean(v), outputs.dtype)
+
+    def infeasibility(self, fn_value):
+        return tf.math.maximum(fn_value - self.max_value, 0.0)
+
+    def call(self, outputs, y_true=None):
+        inf = self.infeasibility(self.fn(outputs, y_true=y_true))
+        if self.inf_cap is not None:
+            inf = tf.math.minimum(inf, tf.cast(self.inf_cap, inf.dtype))
+        lam = tf.math.maximum(self.lmbda, 0.0)
+        if self.max_lambda is not None:
+            lam = tf.math.minimum(lam, tf.cast(self.max_lambda, lam.dtype))
+        l_term = lam * inf
         damp_term = self.damping * tf.square(inf) / 2
         return self.scale * (l_term + damp_term)
 
@@ -214,6 +318,14 @@ class MDMM(keras.Model):
             else:
                 grads_and_vars.append((grad, var))
         self.optimizer.apply_gradients(grads_and_vars)
+
+        # Bandit-style routers (O21c) learn from the realized batch loss rather
+        # than a gradient; they expose bandit_update() and get the loss AFTER
+        # the step so the reward reflects the pair that was actually read out.
+        # hasattr keeps every gradient-router model on the exact old path.
+        for _l in self.model.layers:
+            if hasattr(_l, "bandit_update"):
+                _l.bandit_update(tf.stop_gradient(loss))
 
         out = {"loss": loss, "loss_obj": loss_obj}
         out.update(penalties)
