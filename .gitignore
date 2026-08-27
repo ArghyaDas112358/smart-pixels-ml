@@ -16,3 +16,10 @@ runs/*_link
 runs/*_eval
 *.npz
 *.hdf5
+
+# Slurm job output: 16,240 files / 1.5 GB on this clone alone
+logs/
+
+# Orphan from 2026-07-29: half the size of models/transformer_model_nonquantized.py
+# and imported by nothing. Ignored rather than deleted so the call stays visible.
+two_bit_optimization_helpers/transformer_model_nonquantized.py
