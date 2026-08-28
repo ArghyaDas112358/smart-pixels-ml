@@ -78,8 +78,9 @@ from prepare_tfrecords import load_tfrecords
 from train import create_model
 from AnnealingScheduler import AnnealingScheduler
 from loss import custom_loss
-from conditional_nll import custom_loss_split, custom_loss_v2, nll_terms
-from mdmm import MDMM, MinCorrConstraint, MaxBlockNLLConstraint
+from conditional_nll import (custom_loss_split, custom_loss_v2, nll_terms,
+                             binbalanced_loss_v2_byterm)
+from mdmm import MDMM, MinCorrConstraint, MaxBlockNLLConstraint, ZeroBiasConstraint
 
 BASE = os.environ.get(
     "SMARTPIX_DATA_BASE",
@@ -145,6 +146,44 @@ WARM_SRC_MODEL = os.environ.get('SMARTPIX_WARM_SRC_MODEL', 'ViT_MaxDeep_SimpleRo
 # artifact. val_loss/history numbers under v2 are NOT comparable with the
 # clip-dialect O11..O21 ledger.
 LOSS_V2 = bool(os.environ.get('SMARTPIX_LOSS_V2', ''))
+
+# --- O22: residual-bias removal (quasi-binning + per-bin zero-bias) --------
+# SMARTPIX_ZEROBIAS=1   add one ZeroBiasConstraint per target, NBINS soft bins
+#                       each, one multiplier per bin.
+# SMARTPIX_BINBAL=byterm  swap the task loss for the by-term bin-balanced one.
+#                       Each conditional term is balanced in ITS OWN target's
+#                       bins, which is why no single per-event weight has to
+#                       serve four different binnings.
+# Both default OFF, so every existing recipe is byte-identical.
+ZEROBIAS     = bool(os.environ.get('SMARTPIX_ZEROBIAS', ''))
+BINBAL       = os.environ.get('SMARTPIX_BINBAL', '')
+NBINS        = int(os.environ.get('SMARTPIX_NBINS', '15'))
+# scale is BATCH-sized, like MaxBlockNLLConstraint, NOT MinCorr's 1e4. The task
+# loss is a batch SUM, and the infeasibility is now dimensionless, so a
+# batch-sized scale makes one unit of normalised bias cost about what one event
+# of NLL costs. MinCorr needs 1e4 because correlation infeasibility is tiny and
+# not commensurate with a loss; normalised bias is.
+BIAS_SCALE   = float(os.environ.get('SMARTPIX_BIAS_SCALE', '0') or 0)
+BIAS_DAMPING = float(os.environ.get('SMARTPIX_BIAS_DAMPING', '1.0'))
+# tol in units of the target's residual spread; 0.06 ~ 3x the statistical error
+# on a bin mean, i.e. "consistent with zero". max_lambda is the backstop.
+BIAS_TOL     = float(os.environ.get('SMARTPIX_BIAS_TOL', '0.17'))
+BIAS_MAXLAM  = float(os.environ.get('SMARTPIX_BIAS_MAXLAM', '0') or 0)
+BIAS_INFCAP  = float(os.environ.get('SMARTPIX_BIAS_INFCAP', '0') or 0)
+FREEZE_THR   = bool(os.environ.get('SMARTPIX_FREEZE_THR', ''))
+# How to hold a pair-lattice router fixed.
+#   onehot  -- spike psi at the chosen pair. Readout is that pair, but training
+#              then samples that SAME pair every step.
+#   inherit -- keep the source checkpoint's learned psi and just make it
+#              non-trainable. Readout is still argmax = the chosen pair, and the
+#              training-time sampling is preserved exactly as the parent had it.
+# 'onehot' looks like the stricter freeze and is a trap: the layer samples ONE
+# pair per training step from softmax(phi) and only uses argmax at eval, so
+# seed 22042 drew its winning pair on just 3.6% of steps and something else on
+# the other 96.4%. That sampling is a very large augmentation; removing it made
+# both O22 arms overfit within 200 epochs (control: train -47,218 -> -49,415
+# while val went -39,581 -> -34,220).
+PIN_MODE     = os.environ.get('SMARTPIX_PIN_MODE', 'onehot')
 DIAG_MODE = 'softplus' if LOSS_V2 else 'relu'
 # Ceiling on the effective Lagrange multiplier. '' = uncapped (O12/O13 original).
 # O13 without a cap: lambda reached ~30, penalty ~80,000 vs a task loss of
@@ -429,7 +468,14 @@ class MDMMStateLogger(tf.keras.callbacks.Callback):
                 ['nll_x_c','nll_y_c','nll_cotA_c','nll_cotB_c','nll_pos_c','nll_angle_c'])
     def on_epoch_end(s, epoch, logs=None):
         stds, corrs = pred_stats(s.inner, s.x, s.y)
-        lmb=[float(c.lmbda.numpy()) for c in s.constraints]
+        # A ZeroBiasConstraint carries one lambda PER BIN, so lmbda is a vector.
+        # Log its MEAN here (the column stays one number per constraint, so every
+        # existing reader keeps working) -- the per-bin detail that matters is the
+        # bias itself, which the residual panels show directly.
+        lmb=[]
+        for c in s.constraints:
+            _v = np.atleast_1d(c.lmbda.numpy())
+            lmb.append(float(_v[0]) if _v.size == 1 else float(_v.mean()))
         row = ([epoch] + [f'{v:.6g}' for v in lmb] +
                [f'{corrs[n]:.6g}' for n in MDMM_OUTPUT_COLUMNS] +
                [f'{stds[n]:.6g}' for n in MDMM_OUTPUT_COLUMNS])
@@ -460,6 +506,66 @@ def last_logged_epoch(seed_dir):
         return int(rows[-1]['epoch']) if rows else -1
     except Exception:
         return -1
+
+
+def _pair_lattice_layer(model):
+    """The pair-lattice router, or None.
+
+    Found by ATTRIBUTE, not by name. It shares the name 'simple_router_output'
+    with the 1-D router, so get_layer() finds it and the old FIX_SLICES branch
+    then tries to assign a 101-vector to a 5050-entry psi. Testing for psi/ia/ib
+    is what actually distinguishes the two."""
+    for l in model.layers:
+        if hasattr(l, "psi") and hasattr(l, "ia") and hasattr(l, "ib"):
+            return l
+    return None
+
+
+def _labels_scale():
+    """labels_scale from the dataset metadata -- needed to turn the stored
+    cotangents into the degrees the residual plots are drawn in."""
+    import json as _json
+    try:
+        m = _json.load(open(os.path.join(TFR_TEST, "metadata.json")))
+        return np.asarray(m["labels_scale"], dtype=np.float64)
+    except Exception:
+        return np.ones(4)
+
+
+def _bias_bin_specs(y_sample, nbins):
+    """Soft-bin centres per target, in the space the bias is READ in.
+
+    x and y stay in their own units; the angles are converted to degrees,
+    because cot-space bias and degree-space bias are not the same thing once a
+    bin is wide, and degrees is what the plot that started this shows.
+
+    Returns (constraint_specs, loss_specs, describe) where
+      constraint_specs: (out_col, label_col, centres, sigma, transform, scale)
+      loss_specs:       (term_index, label_col, centres, sigma)   [native space]
+    """
+    sc = _labels_scale()
+    names = ["x", "y", "cotA", "cotB"]
+    out_cols = [0, 2, 4, 6]
+    cons, loss, desc = [], [], []
+    for k, nm in enumerate(names):
+        v = np.asarray(y_sample[:, k], dtype=np.float64)
+        if nm in ("cotA", "cotB"):
+            ang = np.arctan2(1.0, v * sc[k]) * 180.0 / np.pi
+            lo, hi = np.percentile(ang, [1, 99])
+            cen = np.linspace(lo, hi, nbins).astype(np.float32)
+            cons.append((out_cols[k], k, cen, float(cen[1] - cen[0]), "cot2deg", float(sc[k])))
+            desc.append(f"{nm}: {lo:.1f}..{hi:.1f} deg")
+        else:
+            lo, hi = np.percentile(v, [1, 99])
+            cen = np.linspace(lo, hi, nbins).astype(np.float32)
+            cons.append((out_cols[k], k, cen, float(cen[1] - cen[0]), "identity", 1.0))
+            desc.append(f"{nm}: {lo:.3f}..{hi:.3f}")
+        # the loss weights bin in the NATIVE label space -- it only needs the
+        # occupancy, and staying native keeps atan out of the hot loop
+        lo2, hi2 = np.percentile(v, [1, 99])
+        cen2 = np.linspace(lo2, hi2, nbins).astype(np.float32)
+        loss.append((k, k, cen2, float(cen2[1] - cen2[0])))
+    return cons, loss, "; ".join(desc)
 
 
 def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
@@ -518,7 +624,32 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
         model_name = 'ViT_Max_SimpleRouterBeta' if beta else 'ViT_Max_SimpleRouter'
     vit=create_model(model_name, timeslices=N_SLICES, soft_quantize_layer=True,
                      initial_thresholds=thr0, threshold_offset=0.0, initial_levels=LEVELS)
-    if FIX_PAIR is not None:
+    if FIX_PAIR is not None and PIN_MODE == 'onehot' and _pair_lattice_layer(vit) is not None:
+        # The 1-D branch below drives 'simple_router_output'. A pair-lattice
+        # router has no such layer -- its parameter is one logit per PAIR -- so
+        # pinning it means spiking psi at the (i, j) entry, killing the
+        # smoothing kernel, and making psi non-trainable.
+        _pl = _pair_lattice_layer(vit)
+        _i, _j = sorted(FIX_PAIR)
+        _ia, _ib = _pl.ia.numpy(), _pl.ib.numpy()
+        _hit = np.where((_ia == _i) & (_ib == _j))[0]
+        if len(_hit) != 1:
+            raise SystemExit(f"pair ({_i},{_j}) not found in the lattice")
+        _psi = np.full(_ia.shape[0], -30.0, dtype=np.float32)
+        _psi[_hit[0]] = 30.0
+        _pl.psi.assign(_psi)
+        _pl.psi._trainable = False
+        if hasattr(_pl, 'smooth_sigma'):
+            _pl.smooth_sigma.assign(np.zeros_like(_pl.smooth_sigma.numpy()))
+        _chk = _pl.selected_indices()
+        if _chk != [_i, _j]:
+            raise SystemExit(f"pin failed: router still reads {_chk}")
+        stamp(f"[seed {seed}] router PINNED to ({_i}, {_j}) and frozen "
+              f"(psi trainable={_pl.psi.trainable}, sigma=0)")
+    elif FIX_PAIR is not None and _pair_lattice_layer(vit) is None:
+        # 1-D SimpleRouter only. A pair lattice under PIN_MODE=inherit is held
+        # in the warm-start block instead; falling through to here would drive
+        # .theta, which a lattice layer does not have.
         _r = vit.get_layer('simple_router_output')
         _v = np.full(N_SLICES, 0.0, dtype=np.float32)
         for _i in FIX_PAIR:
@@ -542,20 +673,68 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
         src.load_weights(WARM_START)
         assert len(src.layers) == len(vit.layers), \
             f'layer count mismatch: src {len(src.layers)} vs main {len(vit.layers)}'
-        theta_before = vit.get_layer('simple_router_output').theta.numpy().copy()
+        # 'simple_router_output' is the name BOTH router families answer to, but
+        # the 1-D one parameterises theta and the pair lattice parameterises psi.
+        _rt = vit.get_layer('simple_router_output')
+        _is_lattice = _pair_lattice_layer(vit) is not None
+        _rattr = 'theta' if hasattr(_rt, 'theta') else 'psi'
+        theta_before = getattr(_rt, _rattr).numpy().copy()
         n_moved = 0
         for sl, ml in zip(src.layers, vit.layers):
             if ml.name.startswith('simple_router'):
+                if PIN_MODE == 'inherit' and FIX_PAIR is not None and _is_lattice:
+                    _w = sl.get_weights()
+                    if _w:
+                        ml.set_weights(_w)      # psi, visits, smooth_sigma
                 continue
             w = sl.get_weights()
             if w:
                 ml.set_weights(w)
                 n_moved += 1
-        theta_after = vit.get_layer('simple_router_output').theta.numpy()
-        assert np.array_equal(theta_before, theta_after), 'router theta was touched by warm start'
+        theta_after = getattr(_rt, _rattr).numpy()
+        if PIN_MODE == 'inherit' and FIX_PAIR is not None and _is_lattice:
+            _pl = _pair_lattice_layer(vit)
+            _pl.psi._trainable = False
+            _sel = _pl.selected_indices()
+            if _sel != sorted(FIX_PAIR):
+                raise SystemExit(f'inherit pin: source router reads {_sel}, '
+                                 f'expected {sorted(FIX_PAIR)}')
+            _phi = _pl.smooth(tf.convert_to_tensor(_pl.psi)).numpy()
+            _pk = float(np.exp(_phi - _phi.max()).sum())
+            _pk = float(np.max(np.exp(_phi - _phi.max()) / _pk))
+            stamp(f"[seed {seed}] router INHERITED from the source and frozen: "
+                  f"reads {_sel}, psi trainable={_pl.psi.trainable}, "
+                  f"sampler still draws the winner {100*_pk:.1f}% of steps "
+                  f"(the augmentation the one-hot pin would have destroyed)")
+        else:
+            assert np.array_equal(theta_before, theta_after), \
+                f'router {_rattr} was touched by warm start'
         del src
         stamp(f"[seed {seed}] WARM START from {os.path.basename(WARM_START)} "
               f"({WARM_SRC_MODEL}): {n_moved} weighted layers transferred, router theta fresh")
+    if FREEZE_THR:
+        # AFTER the warm start on purpose. The quantizer is not a 'simple_router'
+        # layer, so its thresholds ARE transferred from the source checkpoint --
+        # freezing before the transfer would still end up frozen at the right
+        # numbers, but would report thr0, which is a seed-derived random triple
+        # and not what is actually being held.
+        # Freeze ONLY threshold_deltas_raw: k is annealed by a scheduler that
+        # assigns to it directly, and the levels are a separate calibration, so
+        # freezing the layer wholesale would be a bigger change than was asked.
+        _nfrozen, _thr_now = 0, 'unreadable'
+        for _l in vit.layers:
+            if hasattr(_l, 'threshold_deltas_raw'):
+                _l.threshold_deltas_raw._trainable = False
+                _nfrozen += 1
+                try:
+                    _thr_now = [round(float(v), 2)
+                                for v in np.ravel(_l.thresholds.numpy())]
+                except Exception as _e:
+                    _thr_now = f'unreadable ({type(_e).__name__})'
+        stamp(f"[seed {seed}] ADC thresholds FROZEN at {_thr_now} "
+              f"({_nfrozen} quantizer layer(s))")
+
+    if WARM_START and not resume:
         with open(os.path.join(OUT, 'warm_start.json'), 'w') as f:
             json.dump({'src': WARM_START, 'src_model': WARM_SRC_MODEL,
                        'layers_transferred': n_moved}, f)
@@ -585,6 +764,24 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
                               name=f"corr_{p}")
             for p in MDMM_OUTPUT_COLUMNS
         ]
+    if ZEROBIAS:
+        _cons_specs, _loss_specs, _desc = _bias_bin_specs(cbatch[1], NBINS)
+        _names = ["x", "y", "cotA", "cotB"]
+        _bscale = BIAS_SCALE if BIAS_SCALE > 0 else float(BATCH)
+        for (_oc, _lc, _cen, _sg, _tf, _sc) in _cons_specs:
+            constraints.append(
+                ZeroBiasConstraint(column=_oc, label_column=_lc, centers=_cen,
+                                   sigma=_sg, transform=_tf, label_scale=_sc,
+                                   scale=_bscale, damping=BIAS_DAMPING,
+                                   tol=BIAS_TOL,
+                                   max_lambda=(BIAS_MAXLAM or None),
+                                   inf_cap=(BIAS_INFCAP or None),
+                                   name=f"zbias_{_names[_lc]}"))
+        stamp(f"[seed {seed}] O22 ZERO-BIAS: {len(_cons_specs)} targets x {NBINS} "
+              f"soft bins = {len(_cons_specs)*NBINS} multipliers, scale={_bscale:g} "
+              f"(bias/sigma, tol={BIAS_TOL:g}, max_lambda={BIAS_MAXLAM or None}, "
+              f"inf_cap={BIAS_INFCAP or None})")
+        stamp(f"[seed {seed}] O22 bin ranges -- {_desc}")
     model=MDMM(vit, constraints, constraint_samples=MDMM_CONSTRAINT_SAMPLES,
                constraint_pass='primary', name='mdmm_vit_router')
     # scale=1.0 for the NLL constraint: it is already in the task loss's units, so
@@ -602,7 +799,22 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
               f"comparable with the clip-dialect O11..O21 ledger")
     else:
         task_loss = custom_loss if LOSS_CLIP else (lambda y, p: custom_loss_split(y, p, clip=False))
-    model.compile(optimizer=tf.keras.optimizers.Nadam(learning_rate=1e-3), loss=task_loss)
+    if BINBAL == 'byterm':
+        _bspecs = _bias_bin_specs(cbatch[1], NBINS)[1] if not ZEROBIAS else _loss_specs
+        task_loss = (lambda y, p: binbalanced_loss_v2_byterm(y, p, _bspecs))
+        stamp(f"[seed {seed}] O22 BIN-BALANCED loss (by-term, {NBINS} bins/target) "
+              f"-- the TRAINING loss value is a weighted composite; use plain_nll "
+              f"for anything comparable")
+
+    # plain_nll: the UNWEIGHTED v2 loss, logged every epoch as a metric so the
+    # run stays comparable to the ledger no matter what the training objective
+    # is. v2 and not v1 on purpose -- these checkpoints are softplus-dialect,
+    # and scoring them under v1's relu mapping is the ~7 nat/event artefact.
+    def plain_nll(y, p):
+        return custom_loss_v2(y, p)
+    _metrics = [plain_nll] if LOSS_V2 else []
+    model.compile(optimizer=tf.keras.optimizers.Nadam(learning_rate=1e-3),
+                  loss=task_loss, metrics=_metrics)
 
     if resume:
         model.load_weights(resume_ck)          # delegates to the inner ViT
@@ -710,7 +922,12 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
           'mdmm':{'scale':MDMM_SCALE,'damping':MDMM_DAMPING,'min_corr':MDMM_MIN_CORR,
                   'constraint_samples':MDMM_CONSTRAINT_SAMPLES,
                   'constraint_pass':'primary',
-                  'final_lambdas':{c.name: float(c.lmbda.numpy()) for c in constraints},
+                  # per-bin constraints carry a vector; keep the full list for those
+            'final_lambdas':{c.name: (float(np.atleast_1d(c.lmbda.numpy())[0])
+                                      if np.atleast_1d(c.lmbda.numpy()).size == 1
+                                      else [round(float(v), 6) for v in
+                                            np.atleast_1d(c.lmbda.numpy())])
+                             for c in constraints},
                   'final_pred_corr':final_corrs,'final_pred_std':final_stds},
           'wall_sec':round(time.time()-t0),'data':TFR}
     json.dump(info, open(os.path.join(OUT,'result.json'),'w'), indent=1)

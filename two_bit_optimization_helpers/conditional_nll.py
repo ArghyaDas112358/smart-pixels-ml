@@ -162,3 +162,134 @@ def beta_nll_terms(y, p_base, betas, minval=1e-9):
     b = tf.constant(np.asarray(betas, dtype=np.float32).reshape(1, 4))
     w = tf.stop_gradient(tf.pow(diag, 2.0 * tf.cast(b, diag.dtype)))
     return w * nll_terms(y, p_base, minval)
+
+
+# ---------------------------------------------------------------------------
+# O22: quasi-binning in the TRUE target value.
+#
+# Fix 1 of the residual-bias plan. The plain loss is a SUM over the batch, so
+# whichever region of the label space is densest dominates every gradient step
+# and the sparse tails get outvoted -- the network buys a small gain in the bulk
+# by accepting a systematic bias out at the edges. Weighting each event by the
+# inverse occupancy of its bin makes every region of the label space pull with
+# equal force, i.e. trains against a flat prior instead of the sampled one.
+#
+# "Quasi" because the bins are Gaussian kernels, not hard edges: hard binning is
+# not differentiable in the label and puts arbitrary discontinuities at the bin
+# boundaries.
+# ---------------------------------------------------------------------------
+
+def soft_bin_membership(v, centers, sigma):
+    """K[e, b], rows summing to 1: how much event e belongs to kernel b."""
+    d = (tf.expand_dims(tf.cast(v, tf.float32), -1)
+         - tf.reshape(tf.cast(centers, tf.float32), (1, -1))) / tf.cast(sigma, tf.float32)
+    logk = -0.5 * tf.square(d)
+    return tf.nn.softmax(logk, axis=-1)
+
+
+def soft_bin_weights(y, specs, clip_lo=0.25, clip_hi=4.0):
+    """Per-event weight that flattens the marginal of every target in `specs`.
+
+    specs: list of (label_column, centers, sigma). One weight has to serve all
+    of them -- an event sits in some beta bin AND some alpha bin -- so the
+    per-target inverse-occupancy weights are multiplied and renormalised to mean
+    1. The clip is the safety valve: without it a single event in a sparse
+    corner of the joint space can carry a whole batch's gradient.
+    """
+    w = tf.ones(tf.shape(y)[0], dtype=tf.float32)
+    n = tf.cast(tf.shape(y)[0], tf.float32)
+    for col, centers, sigma in specs:
+        K = soft_bin_membership(y[:, col], centers, sigma)          # (N, B)
+        occ = tf.reduce_sum(K, axis=0)                              # (B,)
+        nb = tf.cast(tf.shape(K)[1], tf.float32)
+        per_ev = tf.reduce_sum(K * (n / (nb * (occ + 1e-6))), axis=-1)
+        w = w * per_ev
+    w = w / (tf.reduce_mean(w) + 1e-12)
+    w = tf.clip_by_value(w, clip_lo, clip_hi)
+    return w / (tf.reduce_mean(w) + 1e-12)
+
+
+def binbalanced_loss_v2(y, p_base, specs, minval=1e-9, clip_lo=0.25, clip_hi=4.0):
+    """Loss v2, but every bin of every target pulls with equal weight.
+
+    REPLACES custom_loss_v2 -- it is not an extra term. Bin-balancing is a
+    statement about how the batch is averaged, so adding it alongside the plain
+    sum would leave the plain sum free to keep outvoting the tails.
+
+    NOTE: this changes the objective, so the reported NLL is NOT comparable with
+    the O11..O21 ledger or with any unweighted loss-v2 run.
+    """
+    per_event = tf.reduce_sum(nll_terms(y, p_base, minval, diag_mode="softplus"), axis=-1)
+    w = soft_bin_weights(y, specs, clip_lo, clip_hi)
+    return tf.reduce_sum(w * per_event)
+
+
+# --- physical-space helpers -------------------------------------------------
+# The angle targets are stored as scaled cotangents, but the bias lgray is
+# reading off is in DEGREES. inverse_cot is continuous through c = 0 once the
+# branch is wrapped (c -> 0+ gives pi/2, c -> 0- gives -pi/2 + pi = pi/2), and
+# its derivative -1/(1+c^2) is smooth everywhere, so this is safe to put inside
+# the training graph.
+
+def cot_to_deg(c_scaled, scale):
+    # atan2(1, c), NOT atan(1/c). Same value everywhere -- atan2 already lands
+    # in (0, pi), which is the branch the eval plot wraps to by hand -- but the
+    # division form has an infinite derivative at c = 0, so a single event with
+    # a near-zero cotangent NaNs the whole batch gradient. atan2 never divides,
+    # and (1, c) never reaches the origin, so it is smooth throughout.
+    c = tf.cast(c_scaled, tf.float32) * tf.cast(scale, tf.float32)
+    return tf.atan2(tf.ones_like(c), c) * (180.0 / np.pi)
+
+
+def per_target_bin_weight(v, centers, sigma, clip_lo=0.25, clip_hi=4.0):
+    """Inverse-occupancy weight for ONE target. Mean 1, clipped."""
+    K = soft_bin_membership(v, centers, sigma)                  # (N, B)
+    occ = tf.reduce_sum(K, axis=0)                              # (B,)
+    n = tf.cast(tf.shape(K)[0], tf.float32)
+    nb = tf.cast(tf.shape(K)[1], tf.float32)
+    w = tf.reduce_sum(K * (n / (nb * (occ + 1e-6))), axis=-1)
+    w = w / (tf.reduce_mean(w) + 1e-12)
+    w = tf.clip_by_value(w, clip_lo, clip_hi)
+    return w / (tf.reduce_mean(w) + 1e-12)
+
+
+def binbalanced_loss_v2_byterm(y, p_base, specs, minval=1e-9,
+                               clip_lo=0.25, clip_hi=4.0):
+    """Loss v2 with EACH conditional term balanced in its OWN target's bins.
+
+    nll_terms already returns the chain-rule decomposition
+        -log p(y) = sum_k -log p(y_k | y_1..y_{k-1}),
+    shape (B, 4), so term k can carry its own weight and no single per-event
+    weight has to serve four different binnings at once. That removes the whole
+    product-of-inverse-occupancies construction, and with it the multiplicative
+    blow-up in sparse corners of the joint space.
+
+    READ THIS BEFORE TRUSTING THE DECOMPOSITION. The terms are CONDITIONAL, not
+    marginal. L is lower-triangular, so forward substitution gives
+        z_k = (r_k - sum_{j<k} L_kj z_j) / L_kk,
+    i.e. term k is target k AFTER conditioning on targets 1..k-1. Weighting it
+    by target k's own occupancy is still the right thing for target k's bias,
+    but the treatment is asymmetric: term 0 (x) is unconditional while term 3
+    (cotB) sits downstream of three conditionings, and the strictly-lower L
+    entries are shared across terms, so reweighting the terms also reweights
+    how hard each correlation is fitted.
+
+    Consequence: the weighted total is a composite objective, not the log
+    likelihood of any single distribution. It is a further dialect change on
+    top of loss v2 -- do not compare its value with anything.
+
+    specs: list of (term_index, label_column, centers, sigma). Terms not listed
+    keep uniform weight.
+    """
+    terms = nll_terms(y, p_base, minval, diag_mode="softplus")   # (B, 4)
+    by_term = {int(t): (c, cen, sg) for (t, c, cen, sg) in specs}
+    cols = []
+    for k in range(terms.shape[-1]):
+        if k in by_term:
+            col, centers, sigma = by_term[k]
+            cols.append(per_target_bin_weight(tf.cast(y[:, col], tf.float32),
+                                              centers, sigma, clip_lo, clip_hi))
+        else:
+            cols.append(tf.ones(tf.shape(y)[0], dtype=tf.float32))
+    W = tf.stack(cols, axis=-1)                                  # (B, 4)
+    return tf.reduce_sum(tf.cast(W, terms.dtype) * terms)

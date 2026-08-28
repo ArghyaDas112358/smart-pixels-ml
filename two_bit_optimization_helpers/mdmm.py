@@ -120,6 +120,118 @@ class MinMadConstraint(OutputConstraint):
         return tf.math.maximum(self.min_value - fn_value, 0.0)
 
 
+class ZeroBiasConstraint(OutputConstraint):
+    """mean( true - pred ) == 0 inside EVERY soft bin of one target.
+
+    Fix 2 of the residual-bias plan, and the reason the plan needs MDMM at all.
+    lgray's "L1 regression with the vertex of the function at y = 0 for each of
+    the bins" is exactly an infeasibility measure of |mean residual|: the V has
+    constant gradient right down to zero, so unlike a squared penalty it keeps
+    pushing instead of going soft near the end and leaving a residual bias.
+
+    One multiplier PER BIN, not one for the constraint. A single shared
+    multiplier would let a large bias in one bin be paid for by small biases
+    elsewhere -- which is the trade we are trying to forbid.
+
+    transform:
+      "identity" -- residual in the model's own label space (x, y)
+      "cot2deg"  -- residual in DEGREES (alpha, beta). The plot that started
+                    this is in degrees, and cot-space and degree-space bias are
+                    not the same thing once a bin is wide, so the angles are
+                    constrained where they are actually read.
+    """
+    needs_truth = True
+
+    def __init__(self, column, label_column, centers, sigma,
+                 transform="identity", label_scale=1.0,
+                 scale=1.0, damping=1.0, tol=0.0, max_lambda=None,
+                 inf_cap=None, **kwargs):
+        # base class makes a scalar lmbda; replace it with one per bin
+        super().__init__(scale=scale, damping=damping, **kwargs)
+        self.column = column
+        self.label_column = label_column
+        self.centers = tf.constant(centers, dtype=tf.float32)
+        self.sigma = float(sigma)
+        self.transform = transform
+        self.label_scale = float(label_scale)
+        # TOLERANCE BAND. "mean bias exactly zero in all 60 bins" is an equality
+        # constraint that is probably not reachable, and an unreachable equality
+        # means lambda climbs forever BY DESIGN -- which is exactly what happened:
+        # the multipliers hit 361k, outvoted the NLL entirely, and the model took
+        # the degenerate escape of widening its predictions (sigma +80..200%),
+        # because a blurrier prediction has less conditional bias almost by
+        # construction. A band makes the constraint SATISFIABLE, so a bin that is
+        # good enough costs nothing and its multiplier relaxes.
+        # tol is in units of the target's own residual spread. Set it against
+        # the PER-BATCH noise, not the eval-set noise: the constraint sees one
+        # batch (5,000 events / 15 soft bins ~ 356 per bin -> a bin mean
+        # fluctuates by 0.056 sigma), while the residual PLOT is drawn on 37,919
+        # events (~2,712 per bin -> 0.021 sigma). Measured, not assumed. A
+        # tolerance derived from the plot's noise sits at ~1 sigma of the
+        # batch noise, so a third of bins breach it by chance every step and
+        # lambda climbs on nothing. 3x the batch noise is ~0.17.
+        self.tol = float(tol)
+        self.max_lambda = max_lambda
+        self.inf_cap = inf_cap
+        self.n_bins = int(len(centers))
+        self.lmbda = self.add_weight(
+            name=self.name + '_lmbda_bins',
+            shape=(self.n_bins,),
+            initializer='zeros',
+            trainable=True,
+        )
+
+    def _to_space(self, v):
+        if self.transform == "cot2deg":
+            from conditional_nll import cot_to_deg
+            return cot_to_deg(v, self.label_scale)
+        return tf.cast(v, tf.float32)
+
+    def fn(self, outputs, y_true=None):
+        """Kernel-weighted mean residual in each bin -> (n_bins,)."""
+        pred = self._to_space(outputs[:, self.column])
+        true = self._to_space(tf.cast(y_true[:, self.label_column], outputs.dtype))
+        res = true - pred
+        d = (tf.expand_dims(true, -1) - tf.reshape(self.centers, (1, -1))) / self.sigma
+        K = tf.nn.softmax(-0.5 * tf.square(d), axis=-1)          # (N, n_bins)
+        occ = tf.reduce_sum(K, axis=0)                            # (n_bins,)
+        return tf.reduce_sum(K * tf.expand_dims(res, -1), axis=0) / (occ + 1e-6)
+
+    def _fn_and_spread(self, outputs, y_true):
+        """Per-bin mean residual, and the overall residual spread it is
+        normalised by. stop_gradient on the spread: it is a unit conversion, not
+        something the model should be able to game by inflating its errors."""
+        pred = self._to_space(outputs[:, self.column])
+        true = self._to_space(tf.cast(y_true[:, self.label_column], outputs.dtype))
+        res = true - pred
+        d = (tf.expand_dims(true, -1) - tf.reshape(self.centers, (1, -1))) / self.sigma
+        K = tf.nn.softmax(-0.5 * tf.square(d), axis=-1)
+        occ = tf.reduce_sum(K, axis=0)
+        bias = tf.reduce_sum(K * tf.expand_dims(res, -1), axis=0) / (occ + 1e-6)
+        spread = tf.stop_gradient(tf.sqrt(tf.math.reduce_variance(res) + 1e-12))
+        return bias, spread
+
+    def infeasibility(self, fn_value):
+        return tf.abs(fn_value)
+
+    def call(self, outputs, y_true=None):
+        bias, spread = self._fn_and_spread(outputs, y_true)
+        # DIMENSIONLESS: bias measured in units of that target's own residual
+        # spread. Without this, x is in microns (bias ~0.5) and beta is in
+        # degrees (bias ~1.5) and one `scale` cannot serve both -- and the
+        # degree targets swamped the task loss by four orders of magnitude.
+        inf = self.infeasibility(bias) / (spread + 1e-6)
+        inf = tf.maximum(inf - self.tol, 0.0)          # inside the band -> free
+        if self.inf_cap is not None:
+            inf = tf.minimum(inf, self.inf_cap)         # one wild bin cannot dominate
+        lam = tf.math.maximum(self.lmbda, 0.0)
+        if self.max_lambda is not None:
+            lam = tf.minimum(lam, self.max_lambda)      # backstop, not the fix
+        l_term = lam * inf
+        damp_term = self.damping * tf.square(inf) / 2
+        return self.scale * tf.reduce_sum(l_term + damp_term)
+
+
 class MinCorrConstraint(OutputConstraint):
     """Pearson corr(outputs[:, column], y_true[:, label_column]) >= min_value.
 
@@ -329,6 +441,17 @@ class MDMM(keras.Model):
 
         out = {"loss": loss, "loss_obj": loss_obj}
         out.update(penalties)
+        # Compiled metrics are NOT surfaced automatically -- this train_step
+        # builds its own return dict, so anything passed to compile(metrics=...)
+        # silently vanishes. O22 needs plain_nll here: the training loss may be a
+        # weighted composite, and plain_nll is the one number that stays
+        # comparable with the ledger.
+        for _m in (self.compiled_metrics._metrics if self.compiled_metrics is not None
+                   and getattr(self.compiled_metrics, "_metrics", None) else []):
+            try:
+                out[_m.__name__ if callable(_m) else str(_m)] = _m(y, y_pred)
+            except Exception:
+                pass
         return out
 
     # --- delegation so existing callbacks/checkpoints work on the inner model ---
