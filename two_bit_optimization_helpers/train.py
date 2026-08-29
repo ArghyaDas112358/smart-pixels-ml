@@ -38,6 +38,8 @@ from models.transformer_model_nonquantized import (
     ViT_Full,
     ViT_Slim,
     ViT_Max_SoftQuantizer,
+    ViT_MaxDeep,
+    ViT_MaxDeep_SoftQuantizer,
     ViT_Full_SoftQuantizer,
     ViT_Slim_SoftQuantizer,
     ViT_Max_SoftRouter,
@@ -90,6 +92,9 @@ model_list = {
     'Mlp_Slim': [Mlp_Slim, Mlp_Slim_SoftQuantizer],
 
     'ViT_Max': [ViT_Max, ViT_Max_SoftQuantizer],
+    # O23 information-ceiling ladder: deep head, no router. [0] = full precision
+    # (arms A/B), [1] = 2-bit quantized (arm C). timeslices picks 101 vs 2.
+    'ViT_MaxDeep': [ViT_MaxDeep, ViT_MaxDeep_SoftQuantizer],
     # joint slice+threshold discovery model: always built via the [1] slot
     # (create_model(..., soft_quantize_layer=True, timeslices=101))
     'ViT_Max_SoftRouter': [ViT_Max_SoftRouter, ViT_Max_SoftRouter],

@@ -116,14 +116,15 @@ def _vit_backbone(
     return outputs
 
 
-def _vit_plain(shape, output):
+def _vit_plain(shape, output, head_dims=(64,)):
     x_in = layers.Input(shape=shape, name="raw_input")
-    outputs = _vit_backbone(x_in, shape, output)
+    outputs = _vit_backbone(x_in, shape, output, head_dims=head_dims)
     return Model(inputs=x_in, outputs=outputs, name="smrtpxl_vit")
 
 
 def _vit_softquantizer(shape, output, initial_thresholds, threshold_offset,
-                       initial_levels=None, trainable_thresholds=True):
+                       initial_levels=None, trainable_thresholds=True,
+                       head_dims=(64,)):
     x_in = layers.Input(shape=shape, name="raw_input")
     x = SoftQuantizeLayer(
         n_bits=2,
@@ -136,7 +137,7 @@ def _vit_softquantizer(shape, output, initial_thresholds, threshold_offset,
         trainable_k=True,
         name="soft_quantizer_output",
     )(x_in)
-    outputs = _vit_backbone(x, shape, output)
+    outputs = _vit_backbone(x, shape, output, head_dims=head_dims)
     return Model(inputs=x_in, outputs=outputs, name="smrtpxl_vit")
 
 
@@ -211,6 +212,24 @@ def ViT_Max(shape):
 
 def ViT_Max_SoftQuantizer(shape, initial_thresholds, threshold_offset, initial_levels=None, trainable_thresholds=True):
     return _vit_softquantizer(shape, 14, initial_thresholds, threshold_offset, initial_levels, trainable_thresholds)
+
+def ViT_MaxDeep(shape):
+    """O23 ceiling ladder, arm A/B: NO router and NO quantizer, with the DEEP
+    regression head. Exists so the full-precision arms differ from the production
+    ViT_MaxDeep_PairLattice in their INPUT BUDGET ONLY. Building the ceiling arm
+    from ViT_Max instead would silently swap in the shallow (64,) head and
+    understate the ceiling -- the one direction of error that would falsely
+    confirm the hypothesis under test."""
+    return _vit_plain(shape, output=14, head_dims=(256, 128, 64))
+
+
+def ViT_MaxDeep_SoftQuantizer(shape, initial_thresholds, threshold_offset,
+                              initial_levels=None, trainable_thresholds=True):
+    """O23 ceiling ladder, arm C: quantizer, no router, deep head."""
+    return _vit_softquantizer(shape, 14, initial_thresholds, threshold_offset,
+                              initial_levels, trainable_thresholds,
+                              head_dims=(256, 128, 64))
+
 
 def ViT_Max_SoftRouter(shape, initial_thresholds, threshold_offset, initial_levels=None, trainable_thresholds=True):
     return _vit_softrouter(shape, 14, initial_thresholds, threshold_offset, initial_levels, trainable_thresholds)
