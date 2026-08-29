@@ -51,9 +51,20 @@ _default = [
     ("tol 0.10", f"{R}/runs/o22_tol010/seed_22042/last.weights.hdf5",          "#b45309"),
 ]
 _env = os.environ.get("SMARTPIX_ARMS", "")
-ARMS = ([(a.split(":")[0], a.split(":", 1)[1], c) for a, c in
-         zip(_env.split(","), ["#7c3aed", "#64748b", "#93c5fd", "#3b82f6", "#15803d", "#b45309"])]
-        if _env else _default)
+if _env:
+    # Generate one colour PER ARM. Zipping against a fixed palette silently
+    # truncated the arm list to the palette length -- a 10-model comparison
+    # evaluated only the first 6 and printed a table that looked complete.
+    import matplotlib.cm as _cm
+    _items = [a for a in _env.split(",") if a.strip()]
+    _cols = ([ "#7c3aed" ] +
+             [matplotlib.colors.to_hex(_cm.viridis(i / max(1, len(_items) - 2)))
+              for i in range(len(_items) - 1)])
+    ARMS = [(a.split(":", 1)[0], a.split(":", 1)[1], c) for a, c in zip(_items, _cols)]
+    assert len(ARMS) == len(_items), "arm/colour length mismatch"
+else:
+    ARMS = _default
+
 TARGETS = [("x", 0, "µm", False), ("y", 1, "µm", False),
            ("alpha", 2, "deg", True), ("beta", 3, "deg", True)]
 
