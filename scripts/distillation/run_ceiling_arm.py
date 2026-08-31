@@ -48,6 +48,26 @@ THRESHOLDS = [8.565593719482422, 20.227340698242188, 47.49168395996094]
 ARMS = {"A": (101, False), "B": (2, False), "C": (101, True), "D": (2, True)}
 
 
+class Checkpointer(tf.keras.callbacks.Callback):
+    """Snapshot weights + OPTIMIZER STATE every `every` epochs so a multi-day run
+    survives a process death. Weights alone are not enough: Nadam carries
+    first/second-moment accumulators, and restarting without them throws the
+    model off its trajectory for hundreds of epochs -- which on this model is
+    the difference between reaching the deep basin and not."""
+    def __init__(s, out, every=25):
+        super().__init__(); s.out = out; s.every = every; s.ck = None
+    def on_epoch_end(s, e, logs=None):
+        if (e + 1) % s.every: return
+        if s.ck is None:
+            s.ck = tf.train.Checkpoint(model=s.model, optimizer=s.model.optimizer)
+        s.model.save_weights(os.path.join(s.out, "last.weights.hdf5"))
+        s.ck.write(os.path.join(s.out, "opt_state"))
+        # write the epoch marker LAST: if we die mid-snapshot, the marker is
+        # older than the weights and we simply redo a few epochs, rather than
+        # resuming from a half-written checkpoint.
+        json.dump({"epoch": e + 1}, open(os.path.join(s.out, "resume_state.json"), "w"))
+
+
 class DivergenceWatch(tf.keras.callbacks.Callback):
     """Arms A-C have no sampler; print the train/val gap so overfitting is
     visible in the log the moment it starts rather than at the post-mortem."""
@@ -125,6 +145,9 @@ def main():
     ap.add_argument("--seed", type=int, default=30042)
     ap.add_argument("--patience", type=int, default=250)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from last.weights.hdf5 + opt_state in --out")
+    ap.add_argument("--ckpt-every", type=int, default=25, dest="ckpt_every")
     ap.add_argument("--nslices", type=int, default=101,
                     help="subsample the waveform to N regularly spaced slices "
                          "(arms A/C only). 101 = the full waveform.")
@@ -157,7 +180,8 @@ def main():
     model.compile(optimizer=tf.keras.optimizers.Nadam(learning_rate=1e-3),
                   loss=custom_loss_v2, metrics=[plain_nll])
 
-    cbs = [tf.keras.callbacks.CSVLogger(os.path.join(OUT, "history.csv")),
+    cbs = [tf.keras.callbacks.CSVLogger(os.path.join(OUT, "history.csv"),
+                                       append=os.path.exists(os.path.join(OUT, "history.csv"))),
            tf.keras.callbacks.ModelCheckpoint(os.path.join(OUT, "best.weights.hdf5"),
                                               monitor="val_plain_nll", save_best_only=True,
                                               save_weights_only=True, mode="min"),
@@ -166,8 +190,30 @@ def main():
         cbs.append(tf.keras.callbacks.EarlyStopping(monitor="val_plain_nll",
                                                     patience=a.patience, mode="min",
                                                     restore_best_weights=True, verbose=1))
+    init_ep = 0
+    if a.resume:
+        st = os.path.join(OUT, "resume_state.json")
+        w  = os.path.join(OUT, "last.weights.hdf5")
+        if os.path.exists(st) and os.path.exists(w):
+            init_ep = int(json.load(open(st))["epoch"])
+            model.load_weights(w)
+            # the optimizer's slot variables only exist after it has been built,
+            # so force one no-op apply before restoring into them
+            model.optimizer.build(model.trainable_variables)
+            try:
+                tf.train.Checkpoint(model=model, optimizer=model.optimizer).read(
+                    os.path.join(OUT, "opt_state")).expect_partial()
+                print(f"  RESUMED from epoch {init_ep} (weights + optimizer state)", flush=True)
+            except Exception as ex:
+                print(f"  RESUMED from epoch {init_ep} (weights only -- optimizer "
+                      f"state not restorable: {ex})", flush=True)
+        else:
+            print("  --resume given but no checkpoint found; starting fresh", flush=True)
+
+    cbs.insert(0, Checkpointer(OUT, every=a.ckpt_every))
     t0 = time.time()
-    h = model.fit(tg, validation_data=vg, epochs=a.epochs, callbacks=cbs, verbose=0)
+    h = model.fit(tg, validation_data=vg, epochs=a.epochs, callbacks=cbs,
+                  initial_epoch=init_ep, verbose=0)
     # ALWAYS save last as well: a torn val_loss line has permanently poisoned a
     # best-monitor before, freezing best.weights for thousands of epochs.
     model.save_weights(os.path.join(OUT, "last.weights.hdf5"))
@@ -175,6 +221,7 @@ def main():
     v = np.asarray(h.history.get("val_plain_nll", h.history["val_loss"]), dtype=float)
     v = v[np.isfinite(v) & (np.abs(v) < 5e6)]
     res = dict(arm=a.arm, seed=a.seed, nslices=a.nslices, dropout=a.dropout,
+           resumed_from=init_ep,
            slice_dropout=a.slice_dropout, slices=(None if n_in == 101 else SLICES),
                quantized=bool(quant), thresholds=(THRESHOLDS if quant else None),
                params=int(model.count_params()), epochs_run=len(h.history["loss"]),
