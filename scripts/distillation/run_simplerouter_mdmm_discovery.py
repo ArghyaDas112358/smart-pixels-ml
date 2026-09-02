@@ -168,6 +168,9 @@ BIAS_DAMPING = float(os.environ.get('SMARTPIX_BIAS_DAMPING', '1.0'))
 # tol in units of the target's residual spread; 0.06 ~ 3x the statistical error
 # on a bin mean, i.e. "consistent with zero". max_lambda is the backstop.
 BIAS_TOL     = float(os.environ.get('SMARTPIX_BIAS_TOL', '0.17'))
+# SMARTPIX_BIAS_START=N  hold the zero-bias term OFF until epoch N. From a
+# cold start the constraint is unsatisfiable -- see BiasGateCallback.
+BIAS_START   = int(os.environ.get('SMARTPIX_BIAS_START', '0') or 0)
 BIAS_MAXLAM  = float(os.environ.get('SMARTPIX_BIAS_MAXLAM', '0') or 0)
 BIAS_INFCAP  = float(os.environ.get('SMARTPIX_BIAS_INFCAP', '0') or 0)
 FREEZE_THR   = bool(os.environ.get('SMARTPIX_FREEZE_THR', ''))
@@ -293,6 +296,30 @@ class HoldAnnealingScheduler(AnnealingScheduler):
         s.schedule_params['total_epochs'] = s.anneal_epochs
     def on_epoch_begin(s, epoch, logs=None):
         super().on_epoch_begin(min(epoch, s.anneal_epochs), logs)
+
+
+class BiasGateCallback(tf.keras.callbacks.Callback):
+    """Hold the zero-bias constraints off until `start`, then switch them on.
+
+    O24's first attempt ran the constraint from epoch zero on a cold model and
+    never learned the task: |bias|/sigma saturates inf_cap in every bin when the
+    weights are random, so the penalty pinned at its 900,000 ceiling against an
+    NLL of 40,411 and 97% of the gradient went into a constraint that could not
+    be satisfied. Note that O22's own warm start WAS a warm-up -- the parent had
+    already trained 10,000 unconstrained epochs before the constraint was added.
+
+    Keyed off the ABSOLUTE epoch, so a resumed chunk re-establishes the right
+    state instead of restarting the warm-up.
+    """
+    def __init__(s, constraints, start):
+        super().__init__(); s.cons = list(constraints); s.start = int(start)
+    def on_epoch_begin(s, epoch, logs=None):
+        want = 1.0 if epoch >= s.start else 0.0
+        for c in s.cons:
+            if abs(float(c.gate.numpy()) - want) > 1e-6:
+                c.gate.assign(want)
+                print(f"[bias gate] epoch {epoch}: zero-bias constraints "
+                      f"{'ENABLED' if want else 'held off'}", flush=True)
 
 
 class DelayedHoldAnnealingScheduler(HoldAnnealingScheduler):
@@ -682,7 +709,7 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
         n_moved = 0
         for sl, ml in zip(src.layers, vit.layers):
             if ml.name.startswith('simple_router'):
-                if PIN_MODE == 'inherit' and FIX_PAIR is not None and _is_lattice:
+                if PIN_MODE in ('inherit', 'inherit_free') and FIX_PAIR is not None and _is_lattice:
                     _w = sl.get_weights()
                     if _w:
                         ml.set_weights(_w)      # psi, visits, smooth_sigma
@@ -692,7 +719,25 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
                 ml.set_weights(w)
                 n_moved += 1
         theta_after = getattr(_rt, _rattr).numpy()
-        if PIN_MODE == 'inherit' and FIX_PAIR is not None and _is_lattice:
+        if PIN_MODE == 'inherit_free' and FIX_PAIR is not None and _is_lattice:
+            # O24b: inherit the source's psi but leave it TRAINABLE. 'inherit'
+            # freezes the readout, which is what O22 needed to attribute its
+            # result to the objective alone. Here the question is the opposite --
+            # given a bias-corrected starting point, does the router MOVE off
+            # (10,21) when the bias term is part of what it optimises? A fresh
+            # psi (the default warm-start path) would not answer that: it would
+            # feed a backbone trained on slices 10 and 21 a uniform draw over all
+            # 5,050 pairs, re-creating the enormous initial bias that saturated
+            # the constraint on the cold attempt.
+            _pl = _pair_lattice_layer(vit)
+            _sel = _pl.selected_indices()
+            _phi = _pl.smooth(tf.convert_to_tensor(_pl.psi)).numpy()
+            _pk = float(np.exp(_phi - _phi.max()).sum())
+            _pk = float(np.max(np.exp(_phi - _phi.max()) / _pk))
+            stamp(f"[seed {seed}] router INHERITED and left FREE: starts on "
+                  f"{_sel}, psi trainable={_pl.psi.trainable}, sampler draws the "
+                  f"incumbent {100*_pk:.1f}% of steps")
+        elif PIN_MODE == 'inherit' and FIX_PAIR is not None and _is_lattice:
             _pl = _pair_lattice_layer(vit)
             _pl.psi._trainable = False
             _sel = _pl.selected_indices()
@@ -706,7 +751,7 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
                   f"reads {_sel}, psi trainable={_pl.psi.trainable}, "
                   f"sampler still draws the winner {100*_pk:.1f}% of steps "
                   f"(the augmentation the one-hot pin would have destroyed)")
-        else:
+        elif PIN_MODE not in ('inherit', 'inherit_free'):
             assert np.array_equal(theta_before, theta_after), \
                 f'router {_rattr} was touched by warm start'
         del src
@@ -781,6 +826,12 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
               f"soft bins = {len(_cons_specs)*NBINS} multipliers, scale={_bscale:g} "
               f"(bias/sigma, tol={BIAS_TOL:g}, max_lambda={BIAS_MAXLAM or None}, "
               f"inf_cap={BIAS_INFCAP or None})")
+        if BIAS_START > 0:
+            for _c in constraints:
+                if hasattr(_c, 'gate'):
+                    _c.gate.assign(0.0)
+            stamp(f"[seed {seed}] O22 ZERO-BIAS held OFF until epoch {BIAS_START} "
+                  f"(cold start: the constraint is unsatisfiable on random weights)")
         stamp(f"[seed {seed}] O22 bin ranges -- {_desc}")
     model=MDMM(vit, constraints, constraint_samples=MDMM_CONSTRAINT_SAMPLES,
                constraint_pass='primary', name='mdmm_vit_router')
@@ -879,6 +930,8 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
                 'cosine', target_layer_name='simple_router_output',
                 initial_k=1.0, final_k=beta['final'], verbose=0,
                 anneal_epochs=beta['epochs'], start_epoch=beta['start'])] if beta else []),
+         *([BiasGateCallback([c for c in constraints if hasattr(c, 'gate')],
+                            BIAS_START)] if (ZEROBIAS and BIAS_START > 0) else []),
          *smooth_cb,
          # save_weights delegates to the inner ViT -> checkpoint loads into a
          # plain create_model for eval, exactly like the unconstrained study.

@@ -46,7 +46,13 @@ module --ignore_cache load python/3.11.9
 source "$VENV/bin/activate"
 export SMARTPIX_TFR=$SCRATCH/TFR_files_all101_noise_contained_discovery
 export TF_CPP_MIN_LOG_LEVEL=1
-export SMARTPIX_GPU_MEM_MB=20000
+# 42 GB, not the historical 20 GB: smallgpu nodes are L40S (46 GB physical),
+# and the zero-bias constraint roughly TRIPLED the per-epoch graph-memory
+# growth -- 20 GB chunks died at ~58 epochs (vs ~155 on the parent campaign),
+# i.e. ~172 queue cycles per seed for 10K epochs. The cap exists to keep the
+# OOM inside TF (clean resume) rather than the CUDA context; 42 GB preserves
+# that with ~4 GB headroom while doubling the epochs each chunk survives.
+export SMARTPIX_GPU_MEM_MB=42000
 export SMARTPIX_MODEL_NAME=$MODEL
 export SMARTPIX_LOSS_V2=1
 export SMARTPIX_ABORT_THR=1e12

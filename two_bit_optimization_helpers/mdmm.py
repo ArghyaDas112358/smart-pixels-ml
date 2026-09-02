@@ -174,6 +174,17 @@ class ZeroBiasConstraint(OutputConstraint):
         self.max_lambda = max_lambda
         self.inf_cap = inf_cap
         self.n_bins = int(len(centers))
+        # WARM-UP GATE. A randomly-initialised model has enormous per-bin bias by
+        # construction, so |bias|/sigma saturates inf_cap in EVERY bin from epoch
+        # one and the penalty pins at its ceiling, scale*n_bins*(max_lambda*
+        # inf_cap + inf_cap^2/2). Measured on O24 seed 40142 that was 900,000
+        # against an NLL of 40,411 -- 97% of the gradient fighting a constraint
+        # the model could not satisfy, and it never learned the task at all.
+        # While the gate is 0 the term contributes nothing, so lambda receives no
+        # gradient and stays put instead of integrating noise.
+        self.gate = self.add_weight(
+            name=self.name + '_gate', shape=(), initializer='ones',
+            trainable=False, dtype=tf.float32)
         self.lmbda = self.add_weight(
             name=self.name + '_lmbda_bins',
             shape=(self.n_bins,),
@@ -229,7 +240,7 @@ class ZeroBiasConstraint(OutputConstraint):
             lam = tf.minimum(lam, self.max_lambda)      # backstop, not the fix
         l_term = lam * inf
         damp_term = self.damping * tf.square(inf) / 2
-        return self.scale * tf.reduce_sum(l_term + damp_term)
+        return self.gate * self.scale * tf.reduce_sum(l_term + damp_term)
 
 
 class MinCorrConstraint(OutputConstraint):
