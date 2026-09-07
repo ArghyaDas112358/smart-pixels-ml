@@ -935,8 +935,12 @@ def run_one_seed(seed, epochs, out_root, tg, vg, stamp, cbatch, beta=None):
          *smooth_cb,
          # save_weights delegates to the inner ViT -> checkpoint loads into a
          # plain create_model for eval, exactly like the unconstrained study.
+         # SMARTPIX_CKPT_MONITOR: which metric picks best.weights. Default val_loss
+         # is the bin-balanced COMPOSITE; under O24b that chose a later epoch and
+         # the plain-NLL optimum (-40.4K, epochs 2-6) was never written to disk.
          tf.keras.callbacks.ModelCheckpoint(os.path.join(OUT,'best.weights.hdf5'),
-                                            save_weights_only=True, monitor='val_loss',
+                                            save_weights_only=True,
+                                            monitor=os.environ.get('SMARTPIX_CKPT_MONITOR','val_loss'),
                                             save_best_only=True),
          tf.keras.callbacks.ModelCheckpoint(os.path.join(OUT,'last.weights.hdf5'),
                                             save_weights_only=True, save_freq='epoch'),

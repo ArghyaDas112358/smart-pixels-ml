@@ -35,7 +35,7 @@ BASE = os.environ.get("SMARTPIX_BASE",
       "10ps_300k_convolved_to_200ps/shuffled_3d")
 TFR = os.environ.get("SMARTPIX_TFR",
       os.path.join(BASE, "TFR_files_all101_noise_contained_discovery"))
-OUT = os.path.join(R, "runs", "perf_plots_o22"); os.makedirs(OUT, exist_ok=True)
+OUT = os.environ.get("SMARTPIX_OUT", os.path.join(R, "runs", "perf_plots_o22")); os.makedirs(OUT, exist_ok=True)
 MODEL = "ViT_MaxDeep_PairLattice"
 LEVELS = np.array([0., 1., 2., 3.], np.float32)
 NB = 15
