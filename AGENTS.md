@@ -17,7 +17,16 @@ You are in the SmartPixels ML repo (CMS smart-pixel ASIC: 2 of 101 time slices,
    (chunk chain, 42 GB cap, resubmit guard). Depot is mounted on both machines.
 5. **Figures** → `runs/perf_plots_*`; scripts `scripts/distillation/make_*.py`.
    Print absolute paths for every figure.
-6. **Platform** → the Purdue AF pod: `/proc/loadavg` and `free` show the host;
+6. **Live status without any session state** → `bash scripts/status_o24.sh`
+   (both machines, all seeds). Agent-independent follow-ons (the −40.4K
+   recovery job, then migrating cold seed 40642 to the A100) run from
+   `scripts/o24_followon_watch.sh` under `setsid`; its log is
+   `runs/o24_followon.log`. Do not launch duplicates of those two jobs.
+7. **Durable facts from earlier agent sessions** → `docs/agent-memory/`
+   (one fact per file; `README.md` is the index). The Claude "Bias and
+   Ceiling" artifact URL in the handoff is read-only for non-Claude agents;
+   the underlying figures are in `runs/perf_plots_*`.
+8. **Platform** → the Purdue AF pod: `/proc/loadavg` and `free` show the host;
    use cgroup files. A100 fits 3–4 trainers. Launch long jobs with
    `setsid nohup … &` and wait on the log, not the pid.
 
